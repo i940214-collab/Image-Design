@@ -2,7 +2,7 @@ var APP_DEFAULTS = {
   timeZone: 'Asia/Taipei',
   spreadsheetId: 'PUT_SPREADSHEET_ID_HERE',
   driveRootFolderId: 'PUT_DRIVE_ROOT_FOLDER_ID_HERE',
-  frontendBaseUrl: '',
+  frontendBaseUrl: 'https://visual-design-tw.github.io/Image-Design/',
   mailSenderName: '畢展形印組管理系統',
   mailReplyTo: '',
   mailFromAlias: '',
@@ -26,11 +26,56 @@ var TABLE_SCHEMAS = {
     types: {}
   },
   Purchase_Items: {
-    headers: ['Item_ID', 'Stage_ID', 'Item_Name', 'Vendor_Price', 'Quantity', 'Subtotal'],
+    headers: ['Item_ID', 'Stage_ID', 'Item_Name', 'Vendor_Price', 'Quantity', 'Subtotal', 'Created_At'],
     types: {
       Vendor_Price: 'number',
       Quantity: 'number',
       Subtotal: 'number'
+    }
+  },
+  Assignments: {
+    headers: [
+      'Assignment_ID',
+      'Stage_ID',
+      'Title',
+      'Body',
+      'Submission_Mode',
+      'Requirement_Text',
+      'Target_Mode',
+      'Target_Team_IDs',
+      'Due_At',
+      'Created_At',
+      'Created_By_User_ID',
+      'Status',
+      'Allow_ReSubmit',
+      'Notify_By_Email',
+      'Email_Notification_Sent'
+    ],
+    types: {
+      Target_Team_IDs: 'json',
+      Allow_ReSubmit: 'boolean',
+      Notify_By_Email: 'boolean',
+      Email_Notification_Sent: 'boolean'
+    }
+  },
+  Assignment_Submissions: {
+    headers: [
+      'Submission_ID',
+      'Assignment_ID',
+      'User_ID',
+      'Team_ID',
+      'Submission_No',
+      'Submission_Mode',
+      'File_Name',
+      'Google_Drive_URL',
+      'Text_Content',
+      'Submitted_At',
+      'Updated_At',
+      'Status',
+      'Notes'
+    ],
+    types: {
+      Submission_No: 'number'
     }
   },
   Files: {
@@ -270,6 +315,41 @@ function saveScriptConfig(spreadsheetId, driveRootFolderId, options) {
   return buildHealthPayload_();
 }
 
+function configureImageDesignDefaults() {
+  return saveScriptConfig('1OSkWSzpcgJqGaGIjC-CzeApZoeyBHMpfen29whTvGKY', '1UV356WstvdKJKzURrqYcbiJcsW4Wdx8Q', {
+    frontendBaseUrl: 'https://visual-design-tw.github.io/Image-Design/',
+    mailSenderName: '畢展形印組管理系統',
+    passwordResetExpiryMinutes: 30,
+    timeZone: 'Asia/Taipei'
+  });
+}
+
+function primeImageDesignProperties() {
+  var props = PropertiesService.getScriptProperties();
+  props.setProperties({
+    SPREADSHEET_ID: '1OSkWSzpcgJqGaGIjC-CzeApZoeyBHMpfen29whTvGKY',
+    DRIVE_ROOT_FOLDER_ID: '1UV356WstvdKJKzURrqYcbiJcsW4Wdx8Q',
+    APP_TIME_ZONE: 'Asia/Taipei',
+    FRONTEND_BASE_URL: 'https://visual-design-tw.github.io/Image-Design/',
+    MAIL_SENDER_NAME: '畢展形印組管理系統',
+    MAIL_REPLY_TO: '',
+    MAIL_FROM_ALIAS: '',
+    PASSWORD_RESET_EXPIRY_MINUTES: '30'
+  }, true);
+
+  return {
+    ok: true,
+    spreadsheetId: '1OSkWSzpcgJqGaGIjC-CzeApZoeyBHMpfen29whTvGKY',
+    driveRootFolderId: '1UV356WstvdKJKzURrqYcbiJcsW4Wdx8Q'
+  };
+}
+
+function authorizeMailScope() {
+  return {
+    remainingDailyQuota: MailApp.getRemainingDailyQuota()
+  };
+}
+
 function setupSheets() {
   return setupSheets_();
 }
@@ -395,12 +475,19 @@ function loadState_() {
     Users: readTable_(spreadsheet, 'Users'),
     Teams: readTable_(spreadsheet, 'Teams'),
     Purchase_Items: readTable_(spreadsheet, 'Purchase_Items'),
+    Assignments: readTable_(spreadsheet, 'Assignments'),
+    Assignment_Submissions: readTable_(spreadsheet, 'Assignment_Submissions'),
     Files: readTable_(spreadsheet, 'Files'),
     Notifications: readTable_(spreadsheet, 'Notifications'),
     Meta: readMetaSheet_(spreadsheet)
   };
 
-  return normalizeState_(state);
+  state = normalizeState_(state);
+  if (backfillPurchaseItemDates_(state)) {
+    writeStateTables_(spreadsheet, state);
+  }
+
+  return state;
 }
 
 function persistState_(inputState) {
@@ -409,16 +496,11 @@ function persistState_(inputState) {
   var state = normalizeState_(cloneObject_(inputState));
   var existingState = loadState_();
   state = mergeSensitiveState_(state, existingState);
+  sendPendingAssignmentAnnouncementEmails_(state);
   var config = getConfig_();
   var spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
 
-  writeTable_(spreadsheet, 'Config_Stages', state.Config_Stages);
-  writeTable_(spreadsheet, 'Users', state.Users);
-  writeTable_(spreadsheet, 'Teams', state.Teams);
-  writeTable_(spreadsheet, 'Purchase_Items', state.Purchase_Items);
-  writeTable_(spreadsheet, 'Files', state.Files);
-  writeTable_(spreadsheet, 'Notifications', state.Notifications);
-  writeMetaSheet_(spreadsheet, state.Meta || {});
+  writeStateTables_(spreadsheet, state);
 }
 
 function loadPasswordResetTokens_() {
@@ -445,9 +527,23 @@ function persistPasswordResetTokens_(records) {
   writeTable_(spreadsheet, 'Password_Reset_Tokens', normalizedRecords);
 }
 
+function writeStateTables_(spreadsheet, state) {
+  writeTable_(spreadsheet, 'Config_Stages', state.Config_Stages);
+  writeTable_(spreadsheet, 'Users', state.Users);
+  writeTable_(spreadsheet, 'Teams', state.Teams);
+  writeTable_(spreadsheet, 'Purchase_Items', state.Purchase_Items);
+  writeTable_(spreadsheet, 'Assignments', state.Assignments);
+  writeTable_(spreadsheet, 'Assignment_Submissions', state.Assignment_Submissions);
+  writeTable_(spreadsheet, 'Files', state.Files);
+  writeTable_(spreadsheet, 'Notifications', state.Notifications);
+  writeMetaSheet_(spreadsheet, state.Meta || {});
+}
+
 function buildClientStateResult_(state, extraData) {
   var result = cloneObject_(extraData || {});
-  result.state = sanitizeStateForClient_(state);
+  var safeState = sanitizeStateForClient_(state);
+  result.state = safeState;
+  result.heatmap = buildHeatmapStats_(safeState);
   return result;
 }
 
@@ -469,6 +565,7 @@ function sanitizeUserRecord_(user) {
 function mergeSensitiveState_(nextState, existingState) {
   var usersById = {};
   var usersByEmail = {};
+  var assignmentsById = {};
 
   ensureArray_(existingState && existingState.Users).forEach(function(user) {
     var normalizedEmail = normalizeEmail_(user.Email);
@@ -478,6 +575,11 @@ function mergeSensitiveState_(nextState, existingState) {
     if (normalizedEmail) {
       usersByEmail[normalizedEmail] = cloneObject_(user);
     }
+  });
+
+  ensureArray_(existingState && existingState.Assignments).forEach(function(assignment) {
+    if (!assignment || !assignment.Assignment_ID) return;
+    assignmentsById[String(assignment.Assignment_ID)] = cloneObject_(assignment);
   });
 
   nextState.Users = ensureArray_(nextState.Users).map(function(user) {
@@ -494,6 +596,17 @@ function mergeSensitiveState_(nextState, existingState) {
     }
 
     return nextUser;
+  });
+
+  nextState.Assignments = ensureArray_(nextState.Assignments).map(function(assignment) {
+    var nextAssignment = cloneObject_(assignment);
+    var existingAssignment = assignmentsById[String(nextAssignment.Assignment_ID || '')] || null;
+
+    nextAssignment.Notify_By_Email = nextAssignment.Notify_By_Email === true;
+    nextAssignment.Email_Notification_Sent = nextAssignment.Email_Notification_Sent === true
+      || Boolean(existingAssignment && existingAssignment.Email_Notification_Sent === true);
+
+    return nextAssignment;
   });
 
   return nextState;
@@ -644,7 +757,15 @@ function normalizeState_(state) {
   state.Config_Stages = ensureArray_(state.Config_Stages);
   state.Users = ensureArray_(state.Users);
   state.Teams = ensureArray_(state.Teams);
-  state.Purchase_Items = ensureArray_(state.Purchase_Items);
+  state.Purchase_Items = ensureArray_(state.Purchase_Items).map(function(item) {
+    return hydratePurchaseItemRecord_(item);
+  });
+  state.Assignments = ensureArray_(state.Assignments).map(function(assignment) {
+    return hydrateAssignmentRecord_(assignment);
+  });
+  state.Assignment_Submissions = ensureArray_(state.Assignment_Submissions).map(function(submission) {
+    return hydrateAssignmentSubmissionRecord_(submission);
+  });
   state.Files = ensureArray_(state.Files);
   state.Notifications = ensureArray_(state.Notifications);
   state.Meta = state.Meta && typeof state.Meta === 'object' ? state.Meta : {};
@@ -663,6 +784,323 @@ function normalizeState_(state) {
   }
 
   return state;
+}
+
+function hydratePurchaseItemRecord_(item) {
+  if (!item || typeof item !== 'object') {
+    item = {};
+  }
+
+  item.Item_ID = String(item.Item_ID || '');
+  item.Stage_ID = String(item.Stage_ID || '');
+  item.Item_Name = String(item.Item_Name || '');
+  item.Vendor_Price = Number(item.Vendor_Price || 0);
+  item.Quantity = Number(item.Quantity || 0);
+  item.Created_At = String(item.Created_At || '');
+  item.Subtotal = Number(item.Subtotal || item.Vendor_Price * item.Quantity || 0);
+
+  return item;
+}
+
+function hydrateAssignmentRecord_(assignment) {
+  if (!assignment || typeof assignment !== 'object') {
+    assignment = {};
+  }
+
+  assignment.Assignment_ID = String(assignment.Assignment_ID || '');
+  assignment.Stage_ID = String(assignment.Stage_ID || '');
+  assignment.Title = String(assignment.Title || '');
+  assignment.Body = String(assignment.Body || '');
+  assignment.Submission_Mode = String(assignment.Submission_Mode || 'file-text');
+  assignment.Requirement_Text = String(assignment.Requirement_Text || '');
+  assignment.Target_Mode = String(assignment.Target_Mode || (ensureArray_(assignment.Target_Team_IDs).length > 0 ? 'selected' : 'all'));
+  assignment.Target_Team_IDs = ensureArray_(assignment.Target_Team_IDs).map(function(teamId) {
+    return String(teamId || '').trim();
+  }).filter(function(teamId) {
+    return !!teamId;
+  });
+  assignment.Due_At = String(assignment.Due_At || '');
+  assignment.Created_At = String(assignment.Created_At || nowString_());
+  assignment.Created_By_User_ID = String(assignment.Created_By_User_ID || '');
+  assignment.Status = String(assignment.Status || '進行中');
+  assignment.Allow_ReSubmit = assignment.Allow_ReSubmit !== false;
+  assignment.Notify_By_Email = assignment.Notify_By_Email === true;
+  assignment.Email_Notification_Sent = assignment.Email_Notification_Sent === true;
+
+  return assignment;
+}
+
+function getAssignmentSubmissionModeLabel_(mode) {
+  var resolved = String(mode || 'file-text').trim();
+  if (resolved === 'file') return '檔案';
+  if (resolved === 'text') return '文字';
+  return '檔案 + 文字';
+}
+
+function getAssignmentTargetTeamIds_(state, assignment) {
+  var targetMode = String(assignment && assignment.Target_Mode || 'all');
+  if (targetMode !== 'selected') {
+    return ensureArray_(state && state.Teams).filter(function(team) {
+      return String(team.Team_ID || '') !== 'T00';
+    }).map(function(team) {
+      return String(team.Team_ID || '').trim();
+    }).filter(function(teamId) {
+      return !!teamId;
+    });
+  }
+
+  return ensureArray_(assignment && assignment.Target_Team_IDs).map(function(teamId) {
+    return String(teamId || '').trim();
+  }).filter(function(teamId) {
+    return !!teamId;
+  });
+}
+
+function getAssignmentTargetTeamLabels_(state, assignment) {
+  var targetIds = getAssignmentTargetTeamIds_(state, assignment);
+  if (targetIds.length === 0) {
+    return '全體小組';
+  }
+
+  return targetIds.map(function(teamId) {
+    var team = ensureArray_(state && state.Teams).find(function(item) {
+      return String(item.Team_ID || '') === teamId;
+    });
+    return team ? String(team.Team_Name || teamId) : teamId;
+  }).join('、');
+}
+
+function getAssignmentAnnouncementRecipients_(state, assignment) {
+  var targetIds = getAssignmentTargetTeamIds_(state, assignment);
+  var recipientsByEmail = {};
+
+  ensureArray_(state && state.Users).forEach(function(user) {
+    var email = normalizeEmail_(user.Email);
+    if (!email) return;
+    if (String(user.Status || '') !== 'Active') return;
+    if (['Leader', 'Member'].indexOf(String(user.Role || '')) === -1) return;
+    if (targetIds.indexOf(String(user.Team_ID || '').trim()) === -1) return;
+    recipientsByEmail[email] = user;
+  });
+
+  return Object.keys(recipientsByEmail).map(function(email) {
+    return recipientsByEmail[email];
+  });
+}
+
+function buildAssignmentAnnouncementEmailText_(user, assignment, stageName, targetLabel, frontendUrl) {
+  var displayName = String(user && user.Name ? user.Name : '同學').trim() || '同學';
+  return [
+    displayName + ' 您好，',
+    '',
+    '您所屬小組有一則新的作業公告。',
+    '',
+    '公告標題：' + String(assignment.Title || ''),
+    '會期：' + String(stageName || '未設定'),
+    '公告對象：' + String(targetLabel || '全體小組'),
+    '截止時間：' + String(assignment.Due_At || '未設定'),
+    '繳交形式：' + getAssignmentSubmissionModeLabel_(assignment.Submission_Mode),
+    '允許重新繳交：' + (assignment.Allow_ReSubmit ? '是' : '否'),
+    '',
+    '公告說明：',
+    String(assignment.Body || '（無）'),
+    '',
+    '繳交需求補充：',
+    String(assignment.Requirement_Text || '（無）'),
+    '',
+    frontendUrl ? '請登入系統查看完整公告：' + frontendUrl : '請登入系統查看完整公告。',
+    '',
+    '畢展形印組管理系統'
+  ].join('\n');
+}
+
+function buildAssignmentAnnouncementEmailHtml_(user, assignment, stageName, targetLabel, frontendUrl) {
+  var displayName = String(user && user.Name ? user.Name : '同學').trim() || '同學';
+  var ctaHtml = frontendUrl
+    ? '<p><a href="' + escapeHtml_(frontendUrl) + '" style="display:inline-block;padding:10px 18px;border-radius:999px;background:#0066CC;color:#FFFFFF;text-decoration:none;font-weight:700;">前往系統查看</a></p>'
+    : '';
+
+  return [
+    '<div style="font-family:Arial,\'PingFang TC\',\'Microsoft JhengHei\',sans-serif;line-height:1.7;color:#1D1D1F;">',
+    '<p>' + escapeHtml_(displayName) + ' 您好，</p>',
+    '<p>您所屬小組有一則新的作業公告。</p>',
+    '<div style="background:#F5F5F7;border:1px solid #E5E5EA;border-radius:16px;padding:16px;">',
+    '<p style="margin:0 0 6px;"><strong>公告標題</strong>：' + escapeHtml_(assignment.Title || '') + '</p>',
+    '<p style="margin:0 0 6px;"><strong>會期</strong>：' + escapeHtml_(stageName || '未設定') + '</p>',
+    '<p style="margin:0 0 6px;"><strong>公告對象</strong>：' + escapeHtml_(targetLabel || '全體小組') + '</p>',
+    '<p style="margin:0 0 6px;"><strong>截止時間</strong>：' + escapeHtml_(assignment.Due_At || '未設定') + '</p>',
+    '<p style="margin:0 0 6px;"><strong>繳交形式</strong>：' + escapeHtml_(getAssignmentSubmissionModeLabel_(assignment.Submission_Mode)) + '</p>',
+    '<p style="margin:0;"><strong>允許重新繳交</strong>：' + (assignment.Allow_ReSubmit ? '是' : '否') + '</p>',
+    '</div>',
+    '<div style="margin-top:16px;">',
+    '<p style="margin:0 0 6px;font-weight:700;">公告說明</p>',
+    '<p style="margin:0;color:#3A3A3C;white-space:pre-line;">' + escapeHtml_(assignment.Body || '（無）') + '</p>',
+    '</div>',
+    '<div style="margin-top:16px;">',
+    '<p style="margin:0 0 6px;font-weight:700;">繳交需求補充</p>',
+    '<p style="margin:0;color:#3A3A3C;white-space:pre-line;">' + escapeHtml_(assignment.Requirement_Text || '（無）') + '</p>',
+    '</div>',
+    '<div style="margin-top:20px;">' + ctaHtml + '</div>',
+    '<p style="font-size:12px;color:#6E6E73;">若您無法使用按鈕，也可以直接前往系統查看完整公告。</p>',
+    '<p style="margin-top:24px;">畢展形印組管理系統</p>',
+    '</div>'
+  ].join('');
+}
+
+function sendAssignmentAnnouncementEmail_(state, assignment) {
+  if (!assignment || assignment.Notify_By_Email !== true || assignment.Email_Notification_Sent === true) {
+    return false;
+  }
+
+  var recipients = getAssignmentAnnouncementRecipients_(state, assignment);
+  var stage = ensureArray_(state && state.Config_Stages).find(function(item) {
+    return String(item.Stage_ID || '') === String(assignment.Stage_ID || '');
+  }) || null;
+  var stageName = stage ? String(stage.Stage_Name || '') : '';
+  var targetLabel = getAssignmentTargetTeamLabels_(state, assignment);
+  var frontendUrl = String(getConfig_().frontendBaseUrl || APP_DEFAULTS.frontendBaseUrl || '').trim();
+  var subject = '【畢展形印組管理系統】新作業公告：' + String(assignment.Title || '未命名作業');
+  var sentAny = false;
+
+  recipients.forEach(function(user) {
+    var email = normalizeEmail_(user.Email);
+    if (!email) return;
+
+    var plainText = buildAssignmentAnnouncementEmailText_(user, assignment, stageName, targetLabel, frontendUrl);
+    var htmlBody = buildAssignmentAnnouncementEmailHtml_(user, assignment, stageName, targetLabel, frontendUrl);
+
+    try {
+      sendSystemEmail_(email, subject, plainText, htmlBody);
+      sentAny = true;
+    } catch (error) {
+      Logger.log('Failed to send assignment announcement email to ' + email + ': ' + error);
+    }
+  });
+
+  assignment.Email_Notification_Sent = true;
+  return sentAny || recipients.length === 0;
+}
+
+function sendPendingAssignmentAnnouncementEmails_(state) {
+  ensureArray_(state && state.Assignments).forEach(function(assignment) {
+    if (!assignment || assignment.Notify_By_Email !== true || assignment.Email_Notification_Sent === true) {
+      return;
+    }
+
+    sendAssignmentAnnouncementEmail_(state, assignment);
+  });
+}
+
+function hydrateAssignmentSubmissionRecord_(submission) {
+  if (!submission || typeof submission !== 'object') {
+    submission = {};
+  }
+
+  submission.Submission_ID = String(submission.Submission_ID || '');
+  submission.Assignment_ID = String(submission.Assignment_ID || '');
+  submission.User_ID = String(submission.User_ID || '');
+  submission.Team_ID = String(submission.Team_ID || '');
+  submission.Submission_No = Number(submission.Submission_No || 1);
+  submission.Submission_Mode = String(submission.Submission_Mode || 'file-text');
+  submission.File_Name = String(submission.File_Name || '');
+  submission.Google_Drive_URL = String(submission.Google_Drive_URL || '');
+  submission.Text_Content = String(submission.Text_Content || '');
+  submission.Submitted_At = String(submission.Submitted_At || nowString_());
+  submission.Updated_At = String(submission.Updated_At || submission.Submitted_At);
+  submission.Status = String(submission.Status || '已繳交');
+  submission.Notes = String(submission.Notes || '');
+
+  return submission;
+}
+
+function backfillPurchaseItemDates_(state) {
+  var changed = false;
+  var config = getConfig_();
+  var purchaseGroups = {};
+  var fileDatesByStage = {};
+
+  ensureArray_(state && state.Files).forEach(function(file) {
+    var stageId = String(file.Stage_ID || '').trim();
+    var dateKey = extractHeatmapDateKey_(file && file.Upload_Time);
+    if (!stageId || !dateKey) return;
+    if (!fileDatesByStage[stageId]) {
+      fileDatesByStage[stageId] = [];
+    }
+    fileDatesByStage[stageId].push(dateKey);
+  });
+
+  ensureArray_(state && state.Purchase_Items).forEach(function(item, index) {
+    var stageId = String(item.Stage_ID || '').trim();
+    if (!stageId) {
+      stageId = '_ungrouped';
+    }
+
+    if (!purchaseGroups[stageId]) {
+      purchaseGroups[stageId] = {
+        stageId: stageId,
+        items: [],
+        anchorKeys: []
+      };
+    }
+
+    purchaseGroups[stageId].items.push({
+      item: item,
+      index: index
+    });
+
+    var itemDateKey = extractHeatmapDateKey_(item && item.Created_At);
+    if (itemDateKey) {
+      purchaseGroups[stageId].anchorKeys.push(itemDateKey);
+    }
+  });
+
+  Object.keys(fileDatesByStage).forEach(function(stageId) {
+    if (!purchaseGroups[stageId]) {
+      purchaseGroups[stageId] = {
+        stageId: stageId,
+        items: [],
+        anchorKeys: []
+      };
+    }
+    purchaseGroups[stageId].anchorKeys = purchaseGroups[stageId].anchorKeys.concat(fileDatesByStage[stageId]);
+  });
+
+  Object.keys(purchaseGroups).forEach(function(stageId) {
+    var group = purchaseGroups[stageId];
+    var missingItems = group.items.filter(function(entry) {
+      return !extractHeatmapDateKey_(entry.item && entry.item.Created_At);
+    }).sort(function(a, b) {
+      var aId = extractSequentialNumber_(a.item && a.item.Item_ID, 'P');
+      var bId = extractSequentialNumber_(b.item && b.item.Item_ID, 'P');
+      if (aId !== bId) return aId - bId;
+      return a.index - b.index;
+    });
+
+    if (missingItems.length === 0) {
+      return;
+    }
+
+    var anchorDateKey = group.anchorKeys.length > 0
+      ? group.anchorKeys.slice().sort().pop()
+      : Utilities.formatDate(new Date(), config.timeZone, 'yyyy-MM-dd');
+    var anchorDate = buildDateFromDateKey_(anchorDateKey);
+    var spanDays = missingItems.length > 1
+      ? Math.max(7, Math.min(42, (missingItems.length - 1) * 7))
+      : 0;
+    var gapDays = missingItems.length > 1
+      ? Math.max(1, Math.floor(spanDays / (missingItems.length - 1)))
+      : 0;
+
+    missingItems.forEach(function(entry, index) {
+      var daysBefore = gapDays * (missingItems.length - 1 - index);
+      var assignedDate = new Date(anchorDate.getTime());
+      assignedDate.setDate(assignedDate.getDate() - daysBefore);
+      entry.item.Created_At = formatDateTime_(assignedDate);
+      changed = true;
+    });
+  });
+
+  return changed;
 }
 
 function hydrateFileRecord_(file) {
@@ -774,6 +1212,142 @@ function refreshFileVersionMetadata_(files) {
       latestFile.Is_Latest = true;
     }
   });
+}
+
+function getAcademicYearRange_() {
+  var config = getConfig_();
+  var now = new Date();
+  var currentYear = Number(Utilities.formatDate(now, config.timeZone, 'yyyy'));
+  var currentMonth = Number(Utilities.formatDate(now, config.timeZone, 'M'));
+  var startYear = currentMonth >= 8 ? currentYear : currentYear - 1;
+  var startDate = new Date(startYear, 7, 1);
+  var endDate = new Date(startYear + 1, 6, 31);
+
+  return {
+    startDate: startDate,
+    endDate: endDate,
+    startKey: Utilities.formatDate(startDate, config.timeZone, 'yyyy-MM-dd'),
+    endKey: Utilities.formatDate(endDate, config.timeZone, 'yyyy-MM-dd'),
+    academicYearLabel: String(startYear) + '-' + String(startYear + 1)
+  };
+}
+
+function extractHeatmapDateKey_(value) {
+  if (Object.prototype.toString.call(value) === '[object Date]' && !isNaN(value.getTime())) {
+    return Utilities.formatDate(value, getConfig_().timeZone, 'yyyy-MM-dd');
+  }
+
+  var raw = String(value || '').trim();
+  if (!raw) {
+    return '';
+  }
+
+  var match = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  return match ? match[1] : '';
+}
+
+function buildDateFromDateKey_(dateKey) {
+  var match = String(dateKey || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) {
+    return new Date();
+  }
+
+  return new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 0, 0, 0));
+}
+
+function extractSequentialNumber_(value, prefix) {
+  var raw = String(value || '');
+  var match = raw.match(new RegExp('^' + String(prefix || '') + '(\\d+)$'));
+  return match ? parseInt(match[1], 10) : 0;
+}
+
+function ensureHeatmapBucket_(bucketMap, dateKey) {
+  if (!bucketMap[dateKey]) {
+    bucketMap[dateKey] = {
+      date: dateKey,
+      files: 0,
+      purchases: 0,
+      assignments: 0,
+      total: 0
+    };
+  }
+
+  return bucketMap[dateKey];
+}
+
+function buildHeatmapStats_(state) {
+  var config = getConfig_();
+  var range = getAcademicYearRange_();
+  var buckets = {};
+  var summary = {
+    files: 0,
+    purchases: 0,
+    assignments: 0,
+    total: 0,
+    activeDays: 0,
+    peakDate: '',
+    peakValue: 0
+  };
+
+  ensureArray_(state && state.Files).forEach(function(file) {
+    var dateKey = extractHeatmapDateKey_(file && file.Upload_Time);
+    if (!dateKey || dateKey < range.startKey || dateKey > range.endKey) {
+      return;
+    }
+
+    ensureHeatmapBucket_(buckets, dateKey).files += 1;
+    summary.files += 1;
+  });
+
+  ensureArray_(state && state.Purchase_Items).forEach(function(item) {
+    var dateKey = extractHeatmapDateKey_(item && item.Created_At);
+    if (!dateKey || dateKey < range.startKey || dateKey > range.endKey) {
+      return;
+    }
+
+    ensureHeatmapBucket_(buckets, dateKey).purchases += 1;
+    summary.purchases += 1;
+  });
+
+  ensureArray_(state && state.Assignment_Submissions).forEach(function(submission) {
+    var submissionDateKey = extractHeatmapDateKey_(submission && (submission.Submitted_At || submission.Updated_At));
+    if (!submissionDateKey || submissionDateKey < range.startKey || submissionDateKey > range.endKey) {
+      return;
+    }
+
+    ensureHeatmapBucket_(buckets, submissionDateKey).assignments += 1;
+    summary.assignments += 1;
+  });
+
+  var timeline = [];
+  var cursor = new Date(range.startDate.getTime());
+
+  while (cursor <= range.endDate) {
+    var dateKey = Utilities.formatDate(cursor, config.timeZone, 'yyyy-MM-dd');
+    var bucket = ensureHeatmapBucket_(buckets, dateKey);
+    bucket.total = Number(bucket.files || 0) + Number(bucket.purchases || 0) + Number(bucket.assignments || 0);
+    timeline.push(cloneObject_(bucket));
+    if (bucket.total > 0) {
+      summary.activeDays += 1;
+    }
+    if (bucket.total > summary.peakValue) {
+      summary.peakValue = bucket.total;
+      summary.peakDate = dateKey;
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  summary.total = summary.files + summary.purchases + summary.assignments;
+
+  return {
+    range: {
+      startDate: range.startKey,
+      endDate: range.endKey,
+      academicYearLabel: range.academicYearLabel
+    },
+    timeline: timeline,
+    summary: summary
+  };
 }
 
 function parseFileMeta_(fileName) {
@@ -1149,7 +1723,7 @@ function handleUploadFile_(payload) {
 
   var effectiveTeamId = teamId || currentUser.Team_ID;
   if (!effectiveTeamId || effectiveTeamId === 'T00') {
-    throw new Error('Only graduation teams can upload files.');
+    throw new Error('Only approved teams can submit assignment attachments.');
   }
 
   var activeStage = stageId
@@ -1173,7 +1747,7 @@ function handleUploadFile_(payload) {
   var latestFile = getLatestFileForGroup_(state.Files, groupKey);
 
   if (latestFile && latestFile.Check_Status !== '退件') {
-    throw new Error('Only rejected files can be re-uploaded.');
+    throw new Error('Only rejected attachments can be resubmitted.');
   }
 
   var relatedFiles = state.Files.filter(function(file) {
@@ -1184,7 +1758,7 @@ function handleUploadFile_(payload) {
   }, 0);
   var nextVersion = Math.max(highestVersion + 1, Number(payload.nextVersion || parsedFile.parsedVersion || 1));
   var storedFileName = buildVersionedFileName_(baseName, nextVersion, extension);
-  var uploadNote = latestFile ? '退件後重新上傳' : '首次送審';
+  var uploadNote = latestFile ? '退件後重新繳交' : '首次繳交';
   var driveResult = routeDriveFile_(driveUrl, activeStage.Stage_Name, team.Team_Name, storedFileName);
   var uploadTime = nowString_();
   var nextFileId = generateSequentialId_('F', state.Files, 'File_ID');
@@ -1212,8 +1786,8 @@ function handleUploadFile_(payload) {
 
   createNotifications_(state, {
     type: nextVersion > 1 ? 'file-version' : 'file-upload',
-    title: team.Team_Name + ' 已送交完稿',
-    message: '「' + storedFileName + '」已進入 ' + activeStage.Stage_Name + ' 審核流程。',
+    title: team.Team_Name + ' 已送出附件',
+    message: '「' + storedFileName + '」已進入 ' + activeStage.Stage_Name + ' 繳交流程。',
     tab: 'files',
     refType: 'file',
     refId: nextFileId,
@@ -1698,19 +2272,10 @@ function sendSystemEmail_(to, subject, textBody, htmlBody) {
   }
 
   if (config.mailFromAlias) {
-    var normalizedAlias = normalizeEmail_(config.mailFromAlias);
-    var aliases = GmailApp.getAliases().map(function(alias) {
-      return normalizeEmail_(alias);
-    });
-
-    if (aliases.indexOf(normalizedAlias) < 0) {
-      throw new Error('MAIL_FROM_ALIAS 尚未設定為部署帳號的 Gmail 寄件別名。');
-    }
-
-    mailOptions.from = normalizedAlias;
+    throw new Error('目前部署版本未啟用 MAIL_FROM_ALIAS。請先清空 MAIL_FROM_ALIAS，或改用 MAIL_REPLY_TO。');
   }
 
-  GmailApp.sendEmail(String(to || '').trim(), String(subject || '').trim(), String(textBody || ''), mailOptions);
+  MailApp.sendEmail(String(to || '').trim(), String(subject || '').trim(), String(textBody || ''), mailOptions);
 }
 
 function escapeHtml_(value) {
@@ -1837,9 +2402,58 @@ function buildDemoState_() {
       { Team_ID: 'T02', Team_Name: 'B組_數位多媒體', Invite_Code: 'B-DIG-3175' }
     ],
     Purchase_Items: [
-      { Item_ID: 'P01', Stage_ID: 'S02', Item_Name: '大圖背板輸出', Vendor_Price: 8500, Quantity: 2, Subtotal: 17000 },
-      { Item_ID: 'P02', Stage_ID: 'S02', Item_Name: '精裝專刊印刷', Vendor_Price: 450, Quantity: 120, Subtotal: 54000 },
-      { Item_ID: 'P03', Stage_ID: 'S02', Item_Name: '導覽酷卡摺頁', Vendor_Price: 15, Quantity: 1000, Subtotal: 15000 }
+      { Item_ID: 'P01', Stage_ID: 'S02', Item_Name: '大圖背板輸出', Vendor_Price: 8500, Quantity: 2, Created_At: '2026-06-18 09:20', Subtotal: 17000 },
+      { Item_ID: 'P02', Stage_ID: 'S02', Item_Name: '精裝專刊印刷', Vendor_Price: 450, Quantity: 120, Created_At: '2026-06-24 14:05', Subtotal: 54000 },
+      { Item_ID: 'P03', Stage_ID: 'S02', Item_Name: '導覽酷卡摺頁', Vendor_Price: 15, Quantity: 1000, Created_At: '2026-07-03 11:40', Subtotal: 15000 }
+    ],
+    Assignments: [
+      {
+        Assignment_ID: 'A01',
+        Stage_ID: 'S02',
+        Title: '第二次會審公告｜主視覺定稿與文字說明',
+        Body: '請各小組依照第二次會審要求，提交主視覺定稿檔案與 100 字內的說明文字。若有需要，也可以附上雲端預覽連結。',
+        Submission_Mode: 'file-text',
+        Requirement_Text: '需繳交作業附件、Google Drive 連結與簡短說明文字。',
+        Target_Mode: 'all',
+        Target_Team_IDs: ['T01', 'T02'],
+        Due_At: '2026-07-10 23:59',
+        Created_At: '2026-07-02 18:00',
+        Created_By_User_ID: 'U01',
+        Status: '進行中',
+        Allow_ReSubmit: true
+      },
+      {
+        Assignment_ID: 'A02',
+        Stage_ID: 'S02',
+        Title: '作業公告｜印刷前自我檢查表',
+        Body: '請各組完成 Pre-flight Checklist，確認字體、色彩模式、出血與解析度都已處理完成後再繳交。',
+        Submission_Mode: 'text',
+        Requirement_Text: '請直接回覆檢查結果與自評說明文字即可。',
+        Target_Mode: 'selected',
+        Target_Team_IDs: ['T01'],
+        Due_At: '2026-07-08 18:00',
+        Created_At: '2026-07-03 09:00',
+        Created_By_User_ID: 'U02',
+        Status: '進行中',
+        Allow_ReSubmit: true
+      }
+    ],
+    Assignment_Submissions: [
+      {
+        Submission_ID: 'SUB01',
+        Assignment_ID: 'A01',
+        User_ID: 'U03',
+        Team_ID: 'T01',
+        Submission_No: 1,
+        Submission_Mode: 'file-text',
+        File_Name: '主視覺海報_定案V2.pdf',
+        Google_Drive_URL: 'https://drive.google.com/open?id=mock_submission_001',
+        Text_Content: '已完成 CMYK 與出血線修正，等待印刷前檢查。',
+        Submitted_At: '2026-07-03 13:20',
+        Updated_At: '2026-07-03 13:20',
+        Status: '已繳交',
+        Notes: ''
+      }
     ],
     Files: [
       {
@@ -1867,12 +2481,12 @@ function buildDemoState_() {
         Google_Drive_URL: 'https://drive.google.com/open?id=mock_file_002',
         Upload_Time: '2026-07-01 14:30',
         Check_Status: '退件',
-        Comment: '色彩模式格式為 RGB，請修改為 CMYK 後重新上傳。',
+        Comment: '色彩模式格式為 RGB，請修改為 CMYK 後重新繳交。',
         Base_File_Name: '主視覺海報_定案',
         File_Extension: '.pdf',
         Version_No: 1,
         File_Group_Key: 'S02|T01|主視覺海報_定案',
-        Revision_Notes: '第一次送審',
+        Revision_Notes: '第一次繳交',
         Drive_File_ID: '',
         Drive_Folder_ID: ''
       }
@@ -1883,7 +2497,7 @@ function buildDemoState_() {
         User_ID: 'U01',
         Type: 'file-upload',
         Title: 'B組上傳新檔案',
-        Message: '「宣傳酷卡背面V3.ai」已送交第二次會審，請前往檔案收件庫查看。',
+        Message: '「宣傳酷卡背面V3.ai」已送交第二次會審，請前往公告作業區查看。',
         Created_At: '2026-07-02 10:15',
         Read: false,
         Tab: 'files',
@@ -1896,7 +2510,7 @@ function buildDemoState_() {
         User_ID: 'U02',
         Type: 'file-upload',
         Title: 'B組上傳新檔案',
-        Message: '「宣傳酷卡背面V3.ai」已送交第二次會審，請前往檔案收件庫查看。',
+        Message: '「宣傳酷卡背面V3.ai」已送交第二次會審，請前往公告作業區查看。',
         Created_At: '2026-07-02 10:15',
         Read: false,
         Tab: 'files',
@@ -1909,7 +2523,7 @@ function buildDemoState_() {
         User_ID: 'U03',
         Type: 'file-rejected',
         Title: 'A組檔案退件',
-        Message: '「主視覺海報_定案.pdf」已退件，請依審核意見修正為 CMYK 後重新上傳。',
+        Message: '「主視覺海報_定案.pdf」已退件，請依審核意見修正為 CMYK 後重新繳交。',
         Created_At: '2026-07-01 14:35',
         Read: false,
         Tab: 'files',
@@ -1922,13 +2536,39 @@ function buildDemoState_() {
         User_ID: 'U04',
         Type: 'file-rejected',
         Title: 'A組檔案退件',
-        Message: '「主視覺海報_定案.pdf」已退件，請依審核意見修正為 CMYK 後重新上傳。',
+        Message: '「主視覺海報_定案.pdf」已退件，請依審核意見修正為 CMYK 後重新繳交。',
         Created_At: '2026-07-01 14:35',
         Read: false,
         Tab: 'files',
         Ref_Type: 'file',
         Ref_ID: 'F02',
         Priority: 'high'
+      },
+      {
+        Notification_ID: 'N05',
+        User_ID: 'U03',
+        Type: 'assignment-post',
+        Title: '新作業公告：主視覺定稿與文字說明',
+        Message: '「第二次會審公告｜主視覺定稿與文字說明」已發布，請前往公告作業區查看與繳交。',
+        Created_At: '2026-07-02 18:00',
+        Read: false,
+        Tab: 'files',
+        Ref_Type: 'assignment',
+        Ref_ID: 'A01',
+        Priority: 'normal'
+      },
+      {
+        Notification_ID: 'N06',
+        User_ID: 'U04',
+        Type: 'assignment-post',
+        Title: '新作業公告：主視覺定稿與文字說明',
+        Message: '「第二次會審公告｜主視覺定稿與文字說明」已發布，請前往公告作業區查看與繳交。',
+        Created_At: '2026-07-02 18:00',
+        Read: false,
+        Tab: 'files',
+        Ref_Type: 'assignment',
+        Ref_ID: 'A01',
+        Priority: 'normal'
       }
     ],
     Meta: {

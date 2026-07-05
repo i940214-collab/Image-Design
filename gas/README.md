@@ -8,6 +8,8 @@
 - `Users`
 - `Teams`
 - `Purchase_Items`
+- `Assignments`
+- `Assignment_Submissions`
 - `Files`
 - `Notifications`
 - `Password_Reset_Tokens`
@@ -24,7 +26,7 @@
   - `action=setup`：建立工作表，可選 `seedDemo: true`
   - `action=login` / `registerLeader` / `registerMember` / `activatePending`
   - `action=saveState`：整包回寫目前前端 state
-  - `action=uploadFile`：建立/續版收件紀錄，並把 Drive 檔案搬到 `會審 / 小組` 資料夾
+  - `action=uploadFile`：建立/續版繳交紀錄，並把 Drive 檔案搬到 `會審 / 小組` 資料夾
   - `action=reviewFile`：更新審核狀態並產生通知
   - `action=markNotificationsRead`
   - `action=clearNotifications`
@@ -48,6 +50,7 @@ saveScriptConfig('你的 Spreadsheet ID', '你的 Drive Root Folder ID', {
   passwordResetExpiryMinutes: 30
 });
 setupSheets();
+authorizeMailScope();
 ```
 
 `frontendBaseUrl` 請填你實際開啟這個前端頁面的網址，例如：
@@ -55,7 +58,7 @@ setupSheets();
 - `https://你的網域/index.html`
 - `http://127.0.0.1:5500/index.html`
 
-如果 `mailFromAlias` 要指定不同寄件地址，必須先在部署 Apps Script 的 Gmail 帳號中設定好「寄件別名」。
+目前這份部署預設使用 `MailApp` 寄信，所以支援 `mailSenderName`、`mailReplyTo`，但不啟用 `mailFromAlias`。如果 `MAIL_FROM_ALIAS` 有填值，重設密碼寄信會直接報錯。
 
 5. 如果你要先用現在前端的假資料測試，再執行：
 
@@ -142,7 +145,7 @@ GET https://script.google.com/macros/s/你的部署ID/exec?action=bootstrap
 - 首次載入：呼叫 `GET action=bootstrap`
 - 每次本地 state 有變更：呼叫 `POST action=saveState`
 
-如果要把上傳流程切成真正的後端自動化，再把目前前端的假模擬上傳改成 `POST action=uploadFile`。
+如果要把作業繳交流程切成真正的後端自動化，再把目前前端的假模擬上傳改成 `POST action=uploadFile`。
 
 ## 注意
 

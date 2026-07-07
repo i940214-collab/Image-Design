@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title><?= pageModel.title ?></title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f5f5f7;
+        --surface: rgba(255, 255, 255, 0.9);
+        --surface-strong: #ffffff;
+        --border: rgba(60, 60, 67, 0.12);
+        --text: #1d1d1f;
+        --muted: #6e6e73;
+        --accent: #0a84ff;
+        --accent-soft: rgba(10, 132, 255, 0.12);
+        --success: #34c759;
+        --error: #ff3b30;
+        --shadow: 0 18px 48px rgba(15, 23, 42, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang TC", "Noto Sans TC", sans-serif;
+        background:
+          radial-gradient(circle at top, rgba(10, 132, 255, 0.09), transparent 34%),
+          var(--bg);
+        color: var(--text);
+      }
+
+      .panel {
+        width: min(100%, 540px);
+        padding: 28px;
+        border-radius: 30px;
+        border: 1px solid rgba(255, 255, 255, 0.75);
+        background: var(--surface);
+        backdrop-filter: blur(28px);
+        box-shadow: var(--shadow);
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 12px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.72);
+        border: 1px solid rgba(60, 60, 67, 0.08);
+        font-size: 11px;
+        font-weight: 700;
+        color: var(--muted);
+        letter-spacing: 0.08em;
+      }
+
+      .eyebrow::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--accent);
+        box-shadow: 0 0 0 6px rgba(10, 132, 255, 0.12);
+      }
+
+      h1 {
+        margin: 18px 0 10px;
+        font-size: 30px;
+        line-height: 1.12;
+        letter-spacing: -0.03em;
+      }
+
+      .subtitle {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.7;
+        font-size: 14px;
+      }
+
+      .meta {
+        margin-top: 20px;
+        padding: 16px;
+        border-radius: 22px;
+        background: rgba(255, 255, 255, 0.78);
+        border: 1px solid var(--border);
+      }
+
+      .meta-label {
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        text-transform: uppercase;
+      }
+
+      .meta-value {
+        margin-top: 8px;
+        font-size: 16px;
+        font-weight: 700;
+        line-height: 1.5;
+        word-break: break-word;
+      }
+
+      .helper {
+        margin-top: 14px;
+        font-size: 13px;
+        color: var(--muted);
+        line-height: 1.7;
+      }
+
+      form {
+        margin-top: 22px;
+      }
+
+      .file-box {
+        padding: 18px;
+        border-radius: 24px;
+        border: 1px solid var(--border);
+        background: var(--surface-strong);
+      }
+
+      label {
+        display: block;
+        margin-bottom: 10px;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      input[type="file"] {
+        width: 100%;
+        font-size: 14px;
+        color: var(--text);
+      }
+
+      input[type="file"]::file-selector-button {
+        margin-right: 12px;
+        padding: 10px 16px;
+        border: 0;
+        border-radius: 14px;
+        background: #1d1d1f;
+        color: #fff;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      .selection {
+        margin-top: 14px;
+        font-size: 13px;
+        color: var(--muted);
+        line-height: 1.7;
+      }
+
+      .hint-row {
+        margin-top: 18px;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .hint-card {
+        padding: 14px 16px;
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.75);
+        border: 1px solid var(--border);
+      }
+
+      .hint-card strong {
+        display: block;
+        margin-bottom: 6px;
+        font-size: 13px;
+      }
+
+      .hint-card span {
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+
+      .status {
+        min-height: 24px;
+        margin-top: 14px;
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .status.is-error {
+        color: var(--error);
+      }
+
+      .status.is-success {
+        color: var(--success);
+      }
+
+      .actions {
+        margin-top: 18px;
+        display: flex;
+        gap: 10px;
+      }
+
+      button {
+        appearance: none;
+        border: 0;
+        border-radius: 16px;
+        padding: 13px 18px;
+        font-size: 14px;
+        font-weight: 700;
+        cursor: pointer;
+        transition: transform 160ms ease, opacity 160ms ease, background 160ms ease;
+      }
+
+      button:hover {
+        transform: translateY(-1px);
+      }
+
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+        transform: none;
+      }
+
+      .btn-secondary {
+        flex: 0 0 auto;
+        background: rgba(29, 29, 31, 0.06);
+        color: var(--text);
+      }
+
+      .btn-primary {
+        flex: 1;
+        background: var(--accent);
+        color: #fff;
+        box-shadow: 0 12px 24px rgba(10, 132, 255, 0.18);
+      }
+
+      .footnote {
+        margin-top: 16px;
+        font-size: 12px;
+        line-height: 1.7;
+        color: var(--muted);
+      }
+
+      @media (max-width: 640px) {
+        body {
+          padding: 16px;
+        }
+
+        .panel {
+          padding: 22px;
+          border-radius: 24px;
+        }
+
+        h1 {
+          font-size: 25px;
+        }
+
+        .hint-row,
+        .actions {
+          grid-template-columns: 1fr;
+          display: grid;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="panel">
+      <span class="eyebrow">Stable Upload</span>
+      <h1><?= pageModel.title ?></h1>
+      <p class="subtitle"><?= pageModel.subtitle ?></p>
+
+      <div class="meta">
+        <div class="meta-label">儲存位置</div>
+        <div class="meta-value"><?= pageModel.pathLabel || "Google Drive" ?></div>
+        <div class="helper"><?= pageModel.helperText ?></div>
+      </div>
+
+      <form id="large-upload-form">
+        <input type="hidden" name="uploadMode" value="<?= pageModel.mode ?>">
+        <input type="hidden" name="sessionKey" value="<?= pageModel.sessionKey ?>">
+        <input type="hidden" name="userId" value="<?= pageModel.userId ?>">
+        <input type="hidden" name="teamId" value="<?= pageModel.teamId ?>">
+        <input type="hidden" name="stageId" value="<?= pageModel.stageId ?>">
+        <input type="hidden" name="assignmentId" value="<?= pageModel.assignmentId ?>">
+        <input type="hidden" name="groupKey" value="<?= pageModel.groupKey ?>">
+        <input type="hidden" name="baseName" value="<?= pageModel.baseName ?>">
+        <input type="hidden" name="extension" value="<?= pageModel.extension ?>">
+        <input type="hidden" name="sourceFileName" value="<?= pageModel.sourceFileName ?>">
+
+        <div class="file-box">
+          <label for="upload-file">重新選擇檔案</label>
+          <input id="upload-file" name="uploadFile" type="file" accept=".ai,.pdf,.psd,.indd,.jpg,.jpeg,.png,.tif,.tiff,.zip" required>
+          <div id="file-selection" class="selection">尚未選擇檔案。</div>
+          <div id="status-message" class="status" aria-live="polite"></div>
+        </div>
+
+        <div class="hint-row">
+          <div class="hint-card">
+            <strong>主頁直傳</strong>
+            <span>建議用於 <?= pageModel.maxDirectMb ?> MB 內檔案，流程較快。</span>
+          </div>
+          <div class="hint-card">
+            <strong>穩定上傳頁</strong>
+            <span>目前支援到約 <?= pageModel.maxStableMb ?> MB，較適合較大附件。</span>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button type="button" class="btn-secondary" onclick="closeWindow()">取消</button>
+          <button type="submit" id="submit-button" class="btn-primary" disabled>開始上傳</button>
+        </div>
+      </form>
+
+      <div class="footnote">上傳成功後，這個頁面會自動通知主視窗並嘗試關閉。</div>
+    </div>
+
+    <script>
+      const model = <?!= JSON.stringify(pageModel).replace(/<\//g, "<\\/") ?>;
+      const maxStableBytes = Number(model.maxStableMb || 50) * 1024 * 1024;
+      const fileInput = document.getElementById("upload-file");
+      const fileSelection = document.getElementById("file-selection");
+      const statusMessage = document.getElementById("status-message");
+      const submitButton = document.getElementById("submit-button");
+      const form = document.getElementById("large-upload-form");
+
+      function formatFileSize(bytes) {
+        const size = Number(bytes || 0);
+        if (!size) return "0 B";
+        if (size < 1024) return size + " B";
+        if (size < 1024 * 1024) return (size / 1024).toFixed(1).replace(/\.0$/, "") + " KB";
+        return (size / (1024 * 1024)).toFixed(1).replace(/\.0$/, "") + " MB";
+      }
+
+      function setStatus(message, tone) {
+        statusMessage.textContent = message || "";
+        statusMessage.className = "status" + (tone ? " is-" + tone : "");
+      }
+
+      function getSelectedFile() {
+        return fileInput && fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+      }
+
+      function updateSelectionState() {
+        const file = getSelectedFile();
+        if (!file) {
+          fileSelection.textContent = "尚未選擇檔案。";
+          setStatus("", "");
+          submitButton.disabled = true;
+          return;
+        }
+
+        fileSelection.textContent = "目前選擇：" + file.name + " ・ " + formatFileSize(file.size);
+        if (Number(file.size || 0) > maxStableBytes) {
+          setStatus("這份檔案已超過穩定上傳頁上限，請再壓縮或分檔。", "error");
+          submitButton.disabled = true;
+          return;
+        }
+
+        setStatus("檔案已準備完成，可以開始上傳。", "success");
+        submitButton.disabled = false;
+      }
+
+      function closeWindow() {
+        window.close();
+      }
+
+      function notifyOpener(result) {
+        if (!window.opener) return;
+        window.opener.postMessage(Object.assign({
+          source: "shapeprint-large-upload",
+          status: "success"
+        }, result || {}), "*");
+      }
+
+      function handleSuccess(result) {
+        setStatus("上傳完成，正在通知主頁。", "success");
+        notifyOpener(result || {});
+        submitButton.disabled = true;
+        submitButton.textContent = "已完成";
+        window.setTimeout(function() {
+          closeWindow();
+        }, 900);
+      }
+
+      function handleFailure(error) {
+        const message = error && error.message ? error.message : "上傳失敗，請稍後再試。";
+        setStatus(message, "error");
+        submitButton.disabled = false;
+        submitButton.textContent = "重新上傳";
+      }
+
+      function handleSubmit(event) {
+        event.preventDefault();
+        const file = getSelectedFile();
+        if (!file) {
+          setStatus("請先重新選擇檔案。", "error");
+          return;
+        }
+        if (Number(file.size || 0) > maxStableBytes) {
+          setStatus("這份檔案已超過穩定上傳頁上限。", "error");
+          return;
+        }
+
+        submitButton.disabled = true;
+        submitButton.textContent = "上傳中...";
+        setStatus("正在將檔案送往 Google 雲端硬碟，請先不要關閉視窗。", "");
+
+        google.script.run
+          .withSuccessHandler(handleSuccess)
+          .withFailureHandler(handleFailure)
+          .processLargeUploadForm(form);
+      }
+
+      fileInput.addEventListener("change", updateSelectionState);
+      form.addEventListener("submit", handleSubmit);
+      updateSelectionState();
+    </script>
+  </body>
+</html>

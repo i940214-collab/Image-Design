@@ -9,6 +9,14 @@ var APP_DEFAULTS = {
   passwordResetExpiryMinutes: 30
 };
 
+var SUPPORTED_UPLOAD_EXTENSIONS = ['.ai', '.pdf', '.psd', '.indd', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.zip'];
+var MAX_BROWSER_UPLOAD_SIZE_BYTES = 18 * 1024 * 1024;
+var MAX_STABLE_WEBAPP_UPLOAD_SIZE_BYTES = 50 * 1024 * 1024;
+var ASSIGNMENT_REMINDER_TRIGGER_HANDLER = 'runScheduledAssignmentReminders';
+var ASSIGNMENT_REMINDER_LOG_META_KEY = 'AssignmentReminderLog';
+var ASSIGNMENT_REMINDER_SETTINGS_META_KEY = 'AssignmentReminderSettings';
+var ASSIGNMENT_REMINDER_DEFAULT_OFFSETS_HOURS = [72, 24, 6];
+
 var TABLE_SCHEMAS = {
   Config_Stages: {
     headers: ['Stage_ID', 'Stage_Name', 'Budget_Allocated', 'Is_Active'],
@@ -72,7 +80,9 @@ var TABLE_SCHEMAS = {
       'Submitted_At',
       'Updated_At',
       'Status',
-      'Notes'
+      'Notes',
+      'Drive_File_ID',
+      'Drive_Folder_ID'
     ],
     types: {
       Submission_No: 'number'
@@ -156,6 +166,14 @@ function doGet(e) {
 
     if (action === 'bootstrap' || action === 'state' || action === 'init') {
       return jsonResponse_(true, buildClientStateResult_(loadState_()));
+    }
+
+    if (action === 'largeUploadPage') {
+      try {
+        return renderLargeUploadPage_(e);
+      } catch (pageError) {
+        return renderLargeUploadErrorPage_(pageError);
+      }
     }
 
     throw new Error('Unsupported GET action: ' + action);
@@ -253,6 +271,13 @@ function doPost(e) {
       return jsonResponse_(true, result);
     }
 
+    if (action === 'uploadAssignmentAsset') {
+      result = withLock_(function() {
+        return handleUploadAssignmentAsset_(payload);
+      });
+      return jsonResponse_(true, result);
+    }
+
     if (action === 'reviewFile') {
       result = withLock_(function() {
         return handleReviewFile_(payload);
@@ -278,6 +303,154 @@ function doPost(e) {
   } catch (error) {
     return jsonResponse_(false, null, error);
   }
+}
+
+function renderLargeUploadPage_(e) {
+  var template = HtmlService.createTemplateFromFile('LargeUpload');
+  template.pageModel = buildLargeUploadPageModel_(e && e.parameter ? e.parameter : {});
+  return template.evaluate()
+    .setTitle('形印組穩定上傳')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+function renderLargeUploadErrorPage_(error) {
+  var message = error && error.message ? error.message : '無法開啟穩定上傳頁。';
+  var safeMessage = String(message).replace(/[<>&"']/g, function(char) {
+    return {
+      '<': '&lt;',
+      '>': '&gt;',
+      '&': '&amp;',
+      '"': '&quot;',
+      "'": '&#39;'
+    }[char];
+  });
+
+  return HtmlService.createHtmlOutput(
+    '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">' +
+    '<title>穩定上傳頁</title>' +
+    '<style>body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang TC","Noto Sans TC",sans-serif;background:#f5f5f7;color:#1d1d1f;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px}.card{max-width:460px;width:100%;background:#fff;border:1px solid #e5e5ea;border-radius:28px;padding:28px;box-shadow:0 16px 48px rgba(15,23,42,.08)}h1{font-size:24px;margin:0 0 10px}p{margin:0;color:#6e6e73;line-height:1.7}</style>' +
+    '</head><body><div class="card"><h1>無法開啟穩定上傳頁</h1><p>' + safeMessage + '</p></div></body></html>'
+  );
+}
+
+function buildLargeUploadPageModel_(params) {
+  var mode = String(params.mode || '').trim();
+  if (['file', 'assignment-asset'].indexOf(mode) === -1) {
+    throw new Error('穩定上傳頁缺少正確的 mode 參數。');
+  }
+
+  var state = loadState_();
+  var userId = String(params.userId || '').trim();
+  var teamId = String(params.teamId || '').trim();
+  var stageId = String(params.stageId || '').trim();
+  var assignmentId = String(params.assignmentId || '').trim();
+  var sourceFileName = String(params.sourceFileName || '').trim();
+  var parsedSource = parseFileMeta_(sourceFileName || 'upload.bin');
+  var baseName = String(params.baseName || parsedSource.baseName || '').trim();
+  var extension = String(params.extension || parsedSource.extension || '').trim();
+  var sessionKey = String(params.sessionKey || '').trim();
+  var groupKey = String(params.groupKey || '').trim();
+
+  var currentUser = ensureArray_(state.Users).find(function(user) {
+    return String(user.User_ID || '') === userId;
+  }) || null;
+  var team = ensureArray_(state.Teams).find(function(item) {
+    return String(item.Team_ID || '') === teamId;
+  }) || null;
+  var assignment = ensureArray_(state.Assignments).find(function(item) {
+    return String(item.Assignment_ID || '') === assignmentId;
+  }) || null;
+  var stage = ensureArray_(state.Config_Stages).find(function(item) {
+    return String(item.Stage_ID || '') === stageId;
+  }) || null;
+
+  if (mode === 'file') {
+    if (!currentUser) {
+      throw new Error('找不到目前登入使用者，請回主頁重新操作。');
+    }
+    if (!team || team.Team_ID === 'T00') {
+      throw new Error('只有正式小組可以使用一般檔案收件上傳。');
+    }
+    if (!stage) {
+      stage = ensureArray_(state.Config_Stages).find(function(item) {
+        return item.Is_Active === true;
+      }) || null;
+    }
+    if (!stage) {
+      throw new Error('找不到目前作用中的會審期數。');
+    }
+  }
+
+  if (mode === 'assignment-asset') {
+    if (!currentUser) {
+      throw new Error('找不到目前登入使用者，請回主頁重新操作。');
+    }
+    if (!team || team.Team_ID === 'T00') {
+      throw new Error('只有正式小組可以使用繳交項目上傳。');
+    }
+    if (!assignment) {
+      throw new Error('找不到指定的繳交項目。');
+    }
+    if (!stage) {
+      stage = ensureArray_(state.Config_Stages).find(function(item) {
+        return String(item.Stage_ID || '') === String(assignment.Stage_ID || '');
+      }) || null;
+    }
+  }
+
+  var pathSegments = mode === 'assignment-asset'
+    ? [stage ? stage.Stage_Name : '', team ? team.Team_Name : '', '公告作業', assignment ? assignment.Title : '']
+    : [stage ? stage.Stage_Name : '', team ? team.Team_Name : ''];
+  var pathLabel = pathSegments.filter(function(segment) {
+    return String(segment || '').trim();
+  }).join(' / ');
+
+  return {
+    mode: mode,
+    sessionKey: sessionKey,
+    userId: userId,
+    teamId: teamId,
+    stageId: stage ? String(stage.Stage_ID || '') : stageId,
+    assignmentId: assignmentId,
+    groupKey: groupKey,
+    baseName: baseName,
+    extension: extension,
+    sourceFileName: sourceFileName,
+    stageName: stage ? String(stage.Stage_Name || '') : '',
+    teamName: team ? String(team.Team_Name || '') : '',
+    assignmentTitle: assignment ? String(assignment.Title || '') : '',
+    pathLabel: pathLabel,
+    maxDirectMb: Math.round(MAX_BROWSER_UPLOAD_SIZE_BYTES / 1024 / 1024),
+    maxStableMb: Math.round(MAX_STABLE_WEBAPP_UPLOAD_SIZE_BYTES / 1024 / 1024),
+    title: mode === 'assignment-asset' ? '繳交項目穩定上傳' : '大檔穩定上傳',
+    subtitle: mode === 'assignment-asset'
+      ? '大於 18 MB 的作業附件會先直接送到雲端，再回主頁完成繳交。'
+      : '大於 18 MB 的收件檔案會透過穩定上傳頁直接寫入 Google 雲端硬碟。',
+    helperText: sourceFileName
+      ? '請在下方重新選擇同一份檔案：' + sourceFileName
+      : '請重新選擇要上傳的檔案。'
+  };
+}
+
+function processLargeUploadForm(formObject) {
+  return withLock_(function() {
+    return processLargeUploadForm_(formObject);
+  });
+}
+
+function processLargeUploadForm_(formObject) {
+  var payload = formObject && typeof formObject === 'object' ? formObject : {};
+  var mode = String(payload.uploadMode || payload.mode || '').trim();
+
+  if (mode === 'file') {
+    return handleLargeFileFormUpload_(payload);
+  }
+
+  if (mode === 'assignment-asset') {
+    return handleLargeAssignmentAssetFormUpload_(payload);
+  }
+
+  throw new Error('未知的穩定上傳模式。');
 }
 
 function pickOptionalConfigValue_(options, key, fallback) {
@@ -350,6 +523,106 @@ function authorizeMailScope() {
   };
 }
 
+function configureAssignmentReminderSettings(options) {
+  return withLock_(function() {
+    var state = loadState_();
+    var nextSettings = normalizeAssignmentReminderSettings_(options);
+    state.Meta[ASSIGNMENT_REMINDER_SETTINGS_META_KEY] = nextSettings;
+    persistState_(state);
+    return {
+      ok: true,
+      settings: nextSettings
+    };
+  });
+}
+
+function enableAssignmentReminderAutomation(options) {
+  var result = configureAssignmentReminderSettings(Object.assign({
+    enabled: true,
+    offsetsHours: ASSIGNMENT_REMINDER_DEFAULT_OFFSETS_HOURS,
+    sendEmail: true,
+    sendSiteNotifications: true
+  }, options || {}));
+  var triggerInfo = installAssignmentReminderTrigger();
+  return {
+    ok: true,
+    settings: result.settings,
+    trigger: triggerInfo
+  };
+}
+
+function disableAssignmentReminderAutomation() {
+  var result = configureAssignmentReminderSettings({
+    enabled: false
+  });
+  var triggerInfo = removeAssignmentReminderTriggers();
+  return {
+    ok: true,
+    settings: result.settings,
+    trigger: triggerInfo
+  };
+}
+
+function installAssignmentReminderTrigger() {
+  removeAssignmentReminderTriggers();
+  var trigger = ScriptApp.newTrigger(ASSIGNMENT_REMINDER_TRIGGER_HANDLER)
+    .timeBased()
+    .everyHours(1)
+    .create();
+
+  return {
+    ok: true,
+    createdTriggerId: trigger.getUniqueId(),
+    triggers: listAssignmentReminderTriggers()
+  };
+}
+
+function removeAssignmentReminderTriggers() {
+  var deleted = [];
+  ScriptApp.getProjectTriggers().forEach(function(trigger) {
+    if (String(trigger.getHandlerFunction() || '') !== ASSIGNMENT_REMINDER_TRIGGER_HANDLER) {
+      return;
+    }
+    deleted.push(trigger.getUniqueId());
+    ScriptApp.deleteTrigger(trigger);
+  });
+
+  return {
+    ok: true,
+    deletedTriggerIds: deleted,
+    triggers: listAssignmentReminderTriggers()
+  };
+}
+
+function listAssignmentReminderTriggers() {
+  return ScriptApp.getProjectTriggers().filter(function(trigger) {
+    return String(trigger.getHandlerFunction() || '') === ASSIGNMENT_REMINDER_TRIGGER_HANDLER;
+  }).map(function(trigger) {
+    return {
+      id: trigger.getUniqueId(),
+      handler: trigger.getHandlerFunction(),
+      eventType: String(trigger.getEventType()),
+      source: String(trigger.getTriggerSource())
+    };
+  });
+}
+
+function runScheduledAssignmentReminders() {
+  return withLock_(function() {
+    var state = loadState_();
+    var result = runScheduledAssignmentRemindersInternal_(state);
+    if (result.changed) {
+      persistState_(state);
+    } else {
+      setupSheets_();
+      var config = getConfig_();
+      var spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
+      writeMetaSheet_(spreadsheet, state.Meta || {});
+    }
+    return result;
+  });
+}
+
 function setupSheets() {
   return setupSheets_();
 }
@@ -412,6 +685,7 @@ function buildHealthPayload_() {
     mailReplyTo: config.mailReplyTo,
     mailFromAliasConfigured: Boolean(config.mailFromAlias),
     passwordResetExpiryMinutes: config.passwordResetExpiryMinutes,
+    assignmentReminderTriggerCount: listAssignmentReminderTriggers().length,
     serverTime: nowString_()
   };
 }
@@ -482,8 +756,16 @@ function loadState_() {
     Meta: readMetaSheet_(spreadsheet)
   };
 
+  var rawNotificationFingerprints = ensureArray_(state.Notifications).map(function(notification) {
+    return buildNotificationNormalizationFingerprint_(notification);
+  });
   state = normalizeState_(state);
-  if (backfillPurchaseItemDates_(state)) {
+  var didNormalizeNotifications = rawNotificationFingerprints.length !== ensureArray_(state.Notifications).length
+    || ensureArray_(state.Notifications).some(function(notification, index) {
+      return rawNotificationFingerprints[index] !== buildNotificationNormalizationFingerprint_(notification);
+    });
+  var didBackfillPurchaseDates = backfillPurchaseItemDates_(state);
+  if (didNormalizeNotifications || didBackfillPurchaseDates) {
     writeStateTables_(spreadsheet, state);
   }
 
@@ -890,25 +1172,26 @@ function getAssignmentAnnouncementRecipients_(state, assignment) {
 
 function buildAssignmentAnnouncementEmailText_(user, assignment, stageName, targetLabel, frontendUrl) {
   var displayName = String(user && user.Name ? user.Name : '同學').trim() || '同學';
+  var dueLabel = formatCompactDateTimeLabel_(assignment.Due_At || '') || '未設定';
   return [
     displayName + ' 您好，',
     '',
-    '您所屬小組有一則新的作業公告。',
+    '您所屬小組有一則新的繳交項目通知。',
     '',
-    '公告標題：' + String(assignment.Title || ''),
+    '項目標題：' + String(assignment.Title || ''),
     '會期：' + String(stageName || '未設定'),
-    '公告對象：' + String(targetLabel || '全體小組'),
-    '截止時間：' + String(assignment.Due_At || '未設定'),
+    '適用對象：' + String(targetLabel || '全體小組'),
+    '截止時間：' + dueLabel,
     '繳交形式：' + getAssignmentSubmissionModeLabel_(assignment.Submission_Mode),
     '允許重新繳交：' + (assignment.Allow_ReSubmit ? '是' : '否'),
     '',
-    '公告說明：',
+    '項目說明：',
     String(assignment.Body || '（無）'),
     '',
     '繳交需求補充：',
     String(assignment.Requirement_Text || '（無）'),
     '',
-    frontendUrl ? '請登入系統查看完整公告：' + frontendUrl : '請登入系統查看完整公告。',
+    frontendUrl ? '請登入系統查看完整內容：' + frontendUrl : '請登入系統查看完整內容。',
     '',
     '畢展形印組管理系統'
   ].join('\n');
@@ -916,6 +1199,7 @@ function buildAssignmentAnnouncementEmailText_(user, assignment, stageName, targ
 
 function buildAssignmentAnnouncementEmailHtml_(user, assignment, stageName, targetLabel, frontendUrl) {
   var displayName = String(user && user.Name ? user.Name : '同學').trim() || '同學';
+  var dueLabel = formatCompactDateTimeLabel_(assignment.Due_At || '') || '未設定';
   var ctaHtml = frontendUrl
     ? '<p><a href="' + escapeHtml_(frontendUrl) + '" style="display:inline-block;padding:10px 18px;border-radius:999px;background:#0066CC;color:#FFFFFF;text-decoration:none;font-weight:700;">前往系統查看</a></p>'
     : '';
@@ -923,17 +1207,17 @@ function buildAssignmentAnnouncementEmailHtml_(user, assignment, stageName, targ
   return [
     '<div style="font-family:Arial,\'PingFang TC\',\'Microsoft JhengHei\',sans-serif;line-height:1.7;color:#1D1D1F;">',
     '<p>' + escapeHtml_(displayName) + ' 您好，</p>',
-    '<p>您所屬小組有一則新的作業公告。</p>',
+    '<p>您所屬小組有一則新的繳交項目通知。</p>',
     '<div style="background:#F5F5F7;border:1px solid #E5E5EA;border-radius:16px;padding:16px;">',
-    '<p style="margin:0 0 6px;"><strong>公告標題</strong>：' + escapeHtml_(assignment.Title || '') + '</p>',
+    '<p style="margin:0 0 6px;"><strong>項目標題</strong>：' + escapeHtml_(assignment.Title || '') + '</p>',
     '<p style="margin:0 0 6px;"><strong>會期</strong>：' + escapeHtml_(stageName || '未設定') + '</p>',
-    '<p style="margin:0 0 6px;"><strong>公告對象</strong>：' + escapeHtml_(targetLabel || '全體小組') + '</p>',
-    '<p style="margin:0 0 6px;"><strong>截止時間</strong>：' + escapeHtml_(assignment.Due_At || '未設定') + '</p>',
+    '<p style="margin:0 0 6px;"><strong>適用對象</strong>：' + escapeHtml_(targetLabel || '全體小組') + '</p>',
+    '<p style="margin:0 0 6px;"><strong>截止時間</strong>：' + escapeHtml_(dueLabel) + '</p>',
     '<p style="margin:0 0 6px;"><strong>繳交形式</strong>：' + escapeHtml_(getAssignmentSubmissionModeLabel_(assignment.Submission_Mode)) + '</p>',
     '<p style="margin:0;"><strong>允許重新繳交</strong>：' + (assignment.Allow_ReSubmit ? '是' : '否') + '</p>',
     '</div>',
     '<div style="margin-top:16px;">',
-    '<p style="margin:0 0 6px;font-weight:700;">公告說明</p>',
+    '<p style="margin:0 0 6px;font-weight:700;">項目說明</p>',
     '<p style="margin:0;color:#3A3A3C;white-space:pre-line;">' + escapeHtml_(assignment.Body || '（無）') + '</p>',
     '</div>',
     '<div style="margin-top:16px;">',
@@ -941,7 +1225,7 @@ function buildAssignmentAnnouncementEmailHtml_(user, assignment, stageName, targ
     '<p style="margin:0;color:#3A3A3C;white-space:pre-line;">' + escapeHtml_(assignment.Requirement_Text || '（無）') + '</p>',
     '</div>',
     '<div style="margin-top:20px;">' + ctaHtml + '</div>',
-    '<p style="font-size:12px;color:#6E6E73;">若您無法使用按鈕，也可以直接前往系統查看完整公告。</p>',
+    '<p style="font-size:12px;color:#6E6E73;">若您無法使用按鈕，也可以直接前往系統查看完整內容。</p>',
     '<p style="margin-top:24px;">畢展形印組管理系統</p>',
     '</div>'
   ].join('');
@@ -959,7 +1243,7 @@ function sendAssignmentAnnouncementEmail_(state, assignment) {
   var stageName = stage ? String(stage.Stage_Name || '') : '';
   var targetLabel = getAssignmentTargetTeamLabels_(state, assignment);
   var frontendUrl = String(getConfig_().frontendBaseUrl || APP_DEFAULTS.frontendBaseUrl || '').trim();
-  var subject = '【畢展形印組管理系統】新作業公告：' + String(assignment.Title || '未命名作業');
+  var subject = '【畢展形印組管理系統】新繳交項目：' + String(assignment.Title || '未命名項目');
   var sentAny = false;
 
   recipients.forEach(function(user) {
@@ -991,6 +1275,363 @@ function sendPendingAssignmentAnnouncementEmails_(state) {
   });
 }
 
+function normalizeAssignmentReminderSettings_(rawSettings) {
+  var settings = rawSettings && typeof rawSettings === 'object' ? cloneObject_(rawSettings) : {};
+  var offsets = ensureArray_(settings.offsetsHours).map(function(value) {
+    return Number(value);
+  }).filter(function(value) {
+    return !isNaN(value) && value > 0;
+  }).sort(function(a, b) {
+    return a - b;
+  });
+
+  if (offsets.length === 0) {
+    offsets = ASSIGNMENT_REMINDER_DEFAULT_OFFSETS_HOURS.slice().sort(function(a, b) {
+      return a - b;
+    });
+  }
+
+  return {
+    enabled: settings.enabled !== false,
+    offsetsHours: offsets,
+    sendEmail: settings.sendEmail !== false,
+    sendSiteNotifications: settings.sendSiteNotifications !== false
+  };
+}
+
+function getAssignmentReminderSettings_(state) {
+  var metaSettings = state && state.Meta ? state.Meta[ASSIGNMENT_REMINDER_SETTINGS_META_KEY] : null;
+  return normalizeAssignmentReminderSettings_(metaSettings);
+}
+
+function getAssignmentReminderLog_(state) {
+  var rawLog = state && state.Meta ? state.Meta[ASSIGNMENT_REMINDER_LOG_META_KEY] : null;
+  if (!rawLog || typeof rawLog !== 'object' || Array.isArray(rawLog)) {
+    rawLog = {};
+  }
+  return rawLog;
+}
+
+function buildAssignmentReminderKey_(assignmentId, teamId, reminderCode) {
+  return [
+    String(assignmentId || '').trim(),
+    String(teamId || '').trim(),
+    String(reminderCode || '').trim()
+  ].join('|');
+}
+
+function hasAssignmentSubmissionForTeam_(state, assignmentId, teamId) {
+  return ensureArray_(state && state.Assignment_Submissions).some(function(submission) {
+    return String(submission.Assignment_ID || '') === String(assignmentId || '')
+      && String(submission.Team_ID || '') === String(teamId || '');
+  });
+}
+
+function getActiveStudentRecipientsForTeam_(state, teamId) {
+  return ensureArray_(state && state.Users).filter(function(user) {
+    return String(user.Team_ID || '') === String(teamId || '')
+      && String(user.Status || '') === 'Active'
+      && ['Leader', 'Member'].indexOf(String(user.Role || '')) >= 0
+      && normalizeEmail_(user.Email);
+  });
+}
+
+function getAssignmentReminderBucket_(hoursUntilDue, offsetsHours) {
+  if (isNaN(hoursUntilDue)) {
+    return null;
+  }
+
+  if (hoursUntilDue <= 0) {
+    return {
+      code: 'overdue',
+      label: '已逾期',
+      priority: 'high'
+    };
+  }
+
+  var matchedOffset = ensureArray_(offsetsHours).find(function(offset) {
+    return hoursUntilDue <= Number(offset);
+  });
+
+  if (!matchedOffset) {
+    return null;
+  }
+
+  return {
+    code: 'before_' + String(matchedOffset).replace(/\./g, '_') + 'h',
+    label: formatReminderOffsetLabel_(matchedOffset),
+    priority: Number(matchedOffset) <= 6 ? 'high' : 'normal',
+    offsetHours: Number(matchedOffset)
+  };
+}
+
+function formatReminderOffsetLabel_(hours) {
+  var numericHours = Number(hours || 0);
+  if (numericHours >= 24 && numericHours % 24 === 0) {
+    return String(numericHours / 24) + ' 天內';
+  }
+  return String(numericHours) + ' 小時內';
+}
+
+function buildAssignmentReminderNotificationMessage_(assignment, dueAtText, bucket) {
+  var dueLabel = formatCompactDateTimeLabel_(dueAtText || assignment.Due_At || '') || '指定時間';
+
+  if (bucket && bucket.code === 'overdue') {
+    return '「' + String(assignment.Title || '未命名作業') + '」已於 ' + dueLabel + ' 截止，目前系統仍未收到你的小組繳交。';
+  }
+
+  return '「' + String(assignment.Title || '未命名作業') + '」將於 ' + dueLabel + ' 截止，目前系統仍未收到你的小組繳交。';
+}
+
+function buildAssignmentReminderEmailText_(user, assignment, stageName, teamName, dueAtText, bucket, frontendUrl) {
+  var displayName = String(user && user.Name ? user.Name : '同學').trim() || '同學';
+  var dueLabel = formatCompactDateTimeLabel_(dueAtText || assignment.Due_At || '') || '未設定';
+  var intro = bucket && bucket.code === 'overdue'
+    ? '系統偵測到你的小組目前仍未完成以下作業繳交，且已超過截止時間。'
+    : '系統提醒你的小組目前仍未完成以下作業繳交。';
+
+  return [
+    displayName + ' 您好，',
+    '',
+    intro,
+    '',
+    '項目標題：' + String(assignment.Title || ''),
+    '會期：' + String(stageName || '未設定'),
+    '所屬小組：' + String(teamName || '未設定'),
+    '提醒節點：' + String(bucket && bucket.label ? bucket.label : '截止提醒'),
+    '截止時間：' + dueLabel,
+    '繳交形式：' + getAssignmentSubmissionModeLabel_(assignment.Submission_Mode),
+    '',
+    '項目說明：',
+    String(assignment.Body || '（無）'),
+    '',
+    '繳交需求補充：',
+    String(assignment.Requirement_Text || '（無）'),
+    '',
+    frontendUrl ? '請盡快登入系統完成繳交：' + frontendUrl : '請盡快登入系統完成繳交。',
+    '',
+    '畢展形印組管理系統'
+  ].join('\n');
+}
+
+function buildAssignmentReminderEmailHtml_(user, assignment, stageName, teamName, dueAtText, bucket, frontendUrl) {
+  var displayName = String(user && user.Name ? user.Name : '同學').trim() || '同學';
+  var dueLabel = formatCompactDateTimeLabel_(dueAtText || assignment.Due_At || '') || '未設定';
+  var intro = bucket && bucket.code === 'overdue'
+    ? '系統偵測到你的小組目前仍未完成以下作業繳交，且已超過截止時間。'
+    : '系統提醒你的小組目前仍未完成以下作業繳交。';
+  var ctaHtml = frontendUrl
+    ? '<p><a href="' + escapeHtml_(frontendUrl) + '" style="display:inline-block;padding:10px 18px;border-radius:999px;background:#0066CC;color:#FFFFFF;text-decoration:none;font-weight:700;">前往系統完成繳交</a></p>'
+    : '';
+
+  return [
+    '<div style="font-family:Arial,\'PingFang TC\',\'Microsoft JhengHei\',sans-serif;line-height:1.7;color:#1D1D1F;">',
+    '<p>' + escapeHtml_(displayName) + ' 您好，</p>',
+    '<p>' + escapeHtml_(intro) + '</p>',
+    '<div style="background:#F5F5F7;border:1px solid #E5E5EA;border-radius:16px;padding:16px;">',
+    '<p style="margin:0 0 6px;"><strong>項目標題</strong>：' + escapeHtml_(assignment.Title || '') + '</p>',
+    '<p style="margin:0 0 6px;"><strong>會期</strong>：' + escapeHtml_(stageName || '未設定') + '</p>',
+    '<p style="margin:0 0 6px;"><strong>所屬小組</strong>：' + escapeHtml_(teamName || '未設定') + '</p>',
+    '<p style="margin:0 0 6px;"><strong>提醒節點</strong>：' + escapeHtml_(bucket && bucket.label ? bucket.label : '截止提醒') + '</p>',
+    '<p style="margin:0 0 6px;"><strong>截止時間</strong>：' + escapeHtml_(dueLabel) + '</p>',
+    '<p style="margin:0;"><strong>繳交形式</strong>：' + escapeHtml_(getAssignmentSubmissionModeLabel_(assignment.Submission_Mode)) + '</p>',
+    '</div>',
+    '<div style="margin-top:16px;">',
+    '<p style="margin:0 0 6px;font-weight:700;">項目說明</p>',
+    '<p style="margin:0;color:#3A3A3C;white-space:pre-line;">' + escapeHtml_(assignment.Body || '（無）') + '</p>',
+    '</div>',
+    '<div style="margin-top:16px;">',
+    '<p style="margin:0 0 6px;font-weight:700;">繳交需求補充</p>',
+    '<p style="margin:0;color:#3A3A3C;white-space:pre-line;">' + escapeHtml_(assignment.Requirement_Text || '（無）') + '</p>',
+    '</div>',
+    '<div style="margin-top:20px;">' + ctaHtml + '</div>',
+    '<p style="font-size:12px;color:#6E6E73;">此信件由 GAS 背景排程自動發送，即使沒有人開啟網站，系統也會依時提醒。</p>',
+    '<p style="margin-top:24px;">畢展形印組管理系統</p>',
+    '</div>'
+  ].join('');
+}
+
+function sendAssignmentReminderEmails_(state, recipients, assignment, team, bucket) {
+  if (!assignment || assignment.Notify_By_Email !== true) {
+    return 0;
+  }
+
+  var stage = ensureArray_(state && state.Config_Stages).find(function(item) {
+    return String(item.Stage_ID || '') === String(assignment.Stage_ID || '');
+  }) || null;
+  var stageName = stage ? String(stage.Stage_Name || '') : '';
+  var teamName = team ? String(team.Team_Name || '') : '';
+  var frontendUrl = String(getConfig_().frontendBaseUrl || APP_DEFAULTS.frontendBaseUrl || '').trim();
+  var dueAtText = String(assignment.Due_At || '未設定');
+  var subject = bucket && bucket.code === 'overdue'
+    ? '【畢展形印組管理系統】逾期提醒：' + String(assignment.Title || '未命名作業')
+    : '【畢展形印組管理系統】繳交提醒：' + String(assignment.Title || '未命名作業');
+  var sentCount = 0;
+
+  ensureArray_(recipients).forEach(function(user) {
+    var email = normalizeEmail_(user.Email);
+    if (!email) return;
+
+    try {
+      sendSystemEmail_(
+        email,
+        subject,
+        buildAssignmentReminderEmailText_(user, assignment, stageName, teamName, dueAtText, bucket, frontendUrl),
+        buildAssignmentReminderEmailHtml_(user, assignment, stageName, teamName, dueAtText, bucket, frontendUrl)
+      );
+      sentCount += 1;
+    } catch (error) {
+      Logger.log('Failed to send assignment reminder email to ' + email + ': ' + error);
+    }
+  });
+
+  return sentCount;
+}
+
+function pruneAssignmentReminderLog_(state) {
+  var reminderLog = getAssignmentReminderLog_(state);
+  var activeAssignmentIds = {};
+  var changed = false;
+
+  ensureArray_(state && state.Assignments).forEach(function(assignment) {
+    activeAssignmentIds[String(assignment.Assignment_ID || '')] = true;
+  });
+
+  Object.keys(reminderLog).forEach(function(key) {
+    var entry = reminderLog[key];
+    var assignmentId = String(entry && entry.assignmentId || key.split('|')[0] || '').trim();
+    if (!activeAssignmentIds[assignmentId]) {
+      delete reminderLog[key];
+      changed = true;
+      return;
+    }
+
+    var dueDate = parseConfiguredDateTime_(entry && entry.dueAt);
+    if (dueDate && ((new Date().getTime() - dueDate.getTime()) > (45 * 24 * 60 * 60 * 1000))) {
+      delete reminderLog[key];
+      changed = true;
+    }
+  });
+
+  state.Meta[ASSIGNMENT_REMINDER_LOG_META_KEY] = reminderLog;
+  return changed;
+}
+
+function runScheduledAssignmentRemindersInternal_(state) {
+  state = normalizeState_(state);
+  state.Meta = state.Meta && typeof state.Meta === 'object' ? state.Meta : {};
+
+  var now = new Date();
+  var settings = getAssignmentReminderSettings_(state);
+  var reminderLog = getAssignmentReminderLog_(state);
+  var sweepAt = formatDateTime_(now);
+  var summary = {
+    ok: true,
+    changed: false,
+    enabled: settings.enabled,
+    checkedAssignments: 0,
+    remindedTeams: 0,
+    notificationsCreated: 0,
+    emailsSent: 0,
+    sweepAt: sweepAt
+  };
+
+  if (!settings.enabled) {
+    state.Meta.LastReminderSweepAt = sweepAt;
+    state.Meta.LastReminderSweepSummary = summary;
+    summary.changed = true;
+    return summary;
+  }
+
+  ensureArray_(state.Assignments).forEach(function(assignment) {
+    if (!assignment || String(assignment.Status || '') !== '進行中') {
+      return;
+    }
+
+    var dueDate = parseConfiguredDateTime_(assignment.Due_At);
+    if (!dueDate) {
+      return;
+    }
+
+    var bucket = getAssignmentReminderBucket_((dueDate.getTime() - now.getTime()) / 3600000, settings.offsetsHours);
+    if (!bucket) {
+      return;
+    }
+
+    var targetTeamIds = getAssignmentTargetTeamIds_(state, assignment);
+    if (targetTeamIds.length === 0) {
+      return;
+    }
+
+    summary.checkedAssignments += 1;
+
+    targetTeamIds.forEach(function(teamId) {
+      if (hasAssignmentSubmissionForTeam_(state, assignment.Assignment_ID, teamId)) {
+        return;
+      }
+
+      var reminderKey = buildAssignmentReminderKey_(assignment.Assignment_ID, teamId, bucket.code);
+      if (reminderLog[reminderKey]) {
+        return;
+      }
+
+      var team = ensureArray_(state.Teams).find(function(item) {
+        return String(item.Team_ID || '') === String(teamId || '');
+      }) || null;
+      var recipients = getActiveStudentRecipientsForTeam_(state, teamId);
+      var createdNotifications = [];
+      var sentEmailCount = 0;
+
+      if (settings.sendSiteNotifications && recipients.length > 0) {
+        createdNotifications = createNotifications_(state, {
+          type: 'assignment-reminder',
+          title: bucket.code === 'overdue'
+            ? '作業逾期提醒：' + String(assignment.Title || '未命名作業')
+            : '作業繳交提醒：' + String(assignment.Title || '未命名作業'),
+          message: buildAssignmentReminderNotificationMessage_(assignment, assignment.Due_At, bucket),
+          tab: 'files',
+          refType: 'assignment',
+          refId: assignment.Assignment_ID,
+          audience: {
+            userIds: recipients.map(function(user) {
+              return String(user.User_ID || '');
+            })
+          },
+          createdAt: sweepAt,
+          priority: bucket.priority || 'normal'
+        });
+      }
+
+      if (settings.sendEmail && recipients.length > 0) {
+        sentEmailCount = sendAssignmentReminderEmails_(state, recipients, assignment, team, bucket);
+      }
+
+      reminderLog[reminderKey] = {
+        assignmentId: String(assignment.Assignment_ID || ''),
+        teamId: String(teamId || ''),
+        reminderCode: bucket.code,
+        dueAt: String(assignment.Due_At || ''),
+        sentAt: sweepAt,
+        notificationCount: createdNotifications.length,
+        emailCount: sentEmailCount
+      };
+
+      summary.remindedTeams += 1;
+      summary.notificationsCreated += createdNotifications.length;
+      summary.emailsSent += sentEmailCount;
+      summary.changed = true;
+    });
+  });
+
+  state.Meta[ASSIGNMENT_REMINDER_LOG_META_KEY] = reminderLog;
+  if (pruneAssignmentReminderLog_(state)) {
+    summary.changed = true;
+  }
+  state.Meta.LastReminderSweepAt = sweepAt;
+  state.Meta.LastReminderSweepSummary = summary;
+  return summary;
+}
+
 function hydrateAssignmentSubmissionRecord_(submission) {
   if (!submission || typeof submission !== 'object') {
     submission = {};
@@ -1009,6 +1650,8 @@ function hydrateAssignmentSubmissionRecord_(submission) {
   submission.Updated_At = String(submission.Updated_At || submission.Submitted_At);
   submission.Status = String(submission.Status || '已繳交');
   submission.Notes = String(submission.Notes || '');
+  submission.Drive_File_ID = String(submission.Drive_File_ID || '');
+  submission.Drive_Folder_ID = String(submission.Drive_Folder_ID || '');
 
   return submission;
 }
@@ -1139,9 +1782,12 @@ function hydrateNotificationRecord_(notification) {
   notification.Notification_ID = String(notification.Notification_ID || '');
   notification.User_ID = String(notification.User_ID || '');
   notification.Type = String(notification.Type || 'system');
-  notification.Title = String(notification.Title || '系統通知');
-  notification.Message = String(notification.Message || '');
-  notification.Created_At = String(notification.Created_At || nowString_());
+  if (notification.Type === 'assignment-overdue') {
+    notification.Type = 'assignment-reminder';
+  }
+  notification.Title = normalizeEmbeddedDateTimes_(String(notification.Title || '系統通知'));
+  notification.Message = normalizeEmbeddedDateTimes_(String(notification.Message || ''));
+  notification.Created_At = normalizeDateTimeStorageValue_(notification.Created_At || nowString_());
   notification.Read = notification.Read === true;
   notification.Tab = String(notification.Tab || 'overview');
   notification.Ref_Type = String(notification.Ref_Type || '');
@@ -1391,6 +2037,41 @@ function buildVersionedFileName_(baseName, versionNo, extension) {
   }
 
   return cleanBase + 'V' + String(versionNo) + cleanExtension;
+}
+
+function buildAssignmentSubmissionFileName_(originalFileName, submissionNo) {
+  var rawFileName = String(originalFileName || '').trim();
+  var resolvedSubmissionNo = Number(submissionNo || 1);
+  var parsed = parseFileMeta_(rawFileName);
+  var cleanBase = String(parsed.baseName || '').trim() || rawFileName;
+  var cleanExtension = String(parsed.extension || '');
+
+  if (!rawFileName) {
+    return cleanExtension || 'submission';
+  }
+
+  if (!resolvedSubmissionNo || resolvedSubmissionNo <= 1) {
+    return rawFileName;
+  }
+
+  return cleanBase + '_第' + String(resolvedSubmissionNo) + '次繳交' + cleanExtension;
+}
+
+function isSupportedUploadExtension_(extension) {
+  return SUPPORTED_UPLOAD_EXTENSIONS.indexOf(String(extension || '').toLowerCase()) !== -1;
+}
+
+function sanitizeDriveEntryName_(value, fallbackValue) {
+  var cleaned = String(value || '')
+    .replace(/[\\\/]+/g, '・')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (cleaned) {
+    return cleaned;
+  }
+
+  return String(fallbackValue || '').trim();
 }
 
 function getLatestFileForGroup_(files, groupKey) {
@@ -1697,10 +2378,13 @@ function handleResetPassword_(payload) {
 function handleUploadFile_(payload) {
   var state = loadState_();
   var userId = String(payload.userId || payload.currentUserId || '').trim();
-  var fileName = String(payload.fileName || '').trim();
+  var fileName = String(payload.fileName || payload.sourceFileName || '').trim();
   var driveUrl = String(payload.googleDriveUrl || payload.driveUrl || payload.url || '').trim();
+  var fileContentBase64 = String(payload.fileContentBase64 || payload.base64 || '').trim();
+  var mimeType = String(payload.mimeType || 'application/octet-stream').trim();
   var stageId = String(payload.stageId || '').trim();
   var teamId = String(payload.teamId || '').trim();
+  var fileSize = Number(payload.fileSize || 0);
 
   if (!userId) {
     throw new Error('uploadFile requires `userId`.');
@@ -1710,8 +2394,12 @@ function handleUploadFile_(payload) {
     throw new Error('uploadFile requires `fileName`.');
   }
 
-  if (!driveUrl) {
-    throw new Error('uploadFile requires `googleDriveUrl`.');
+  if (!driveUrl && !fileContentBase64) {
+    throw new Error('uploadFile requires `googleDriveUrl` or `fileContentBase64`.');
+  }
+
+  if (fileSize > MAX_BROWSER_UPLOAD_SIZE_BYTES) {
+    throw new Error('檔案超過目前直傳上限 18 MB。');
   }
 
   var currentUser = state.Users.find(function(user) {
@@ -1743,6 +2431,15 @@ function handleUploadFile_(payload) {
   var parsedFile = parseFileMeta_(fileName);
   var baseName = String(payload.baseName || parsedFile.baseName || '').trim();
   var extension = String(payload.extension || parsedFile.extension || '').trim();
+
+  if (!extension) {
+    throw new Error('檔案名稱需包含副檔名。');
+  }
+
+  if (!isSupportedUploadExtension_(extension)) {
+    throw new Error('目前只支援 ai、pdf、psd、indd、圖像格式與 zip。');
+  }
+
   var groupKey = String(payload.groupKey || makeFileGroupKey_(activeStage.Stage_ID, effectiveTeamId, baseName)).trim();
   var latestFile = getLatestFileForGroup_(state.Files, groupKey);
 
@@ -1759,7 +2456,9 @@ function handleUploadFile_(payload) {
   var nextVersion = Math.max(highestVersion + 1, Number(payload.nextVersion || parsedFile.parsedVersion || 1));
   var storedFileName = buildVersionedFileName_(baseName, nextVersion, extension);
   var uploadNote = latestFile ? '退件後重新繳交' : '首次繳交';
-  var driveResult = routeDriveFile_(driveUrl, activeStage.Stage_Name, team.Team_Name, storedFileName);
+  var driveResult = driveUrl
+    ? routeDriveFile_(driveUrl, activeStage.Stage_Name, team.Team_Name, storedFileName)
+    : createDriveFileFromBase64_(fileContentBase64, mimeType, fileName, [activeStage.Stage_Name, team.Team_Name], storedFileName);
   var uploadTime = nowString_();
   var nextFileId = generateSequentialId_('F', state.Files, 'File_ID');
 
@@ -1805,6 +2504,355 @@ function handleUploadFile_(payload) {
     file: createdFile,
     drive: driveResult
   });
+}
+
+function handleUploadAssignmentAsset_(payload) {
+  var state = loadState_();
+  var userId = String(payload.userId || payload.currentUserId || '').trim();
+  var assignmentId = String(payload.assignmentId || '').trim();
+  var fileName = String(payload.fileName || payload.sourceFileName || '').trim();
+  var fileContentBase64 = String(payload.fileContentBase64 || payload.base64 || '').trim();
+  var mimeType = String(payload.mimeType || 'application/octet-stream').trim();
+  var teamId = String(payload.teamId || '').trim();
+  var fileSize = Number(payload.fileSize || 0);
+
+  if (!userId) {
+    throw new Error('uploadAssignmentAsset requires `userId`.');
+  }
+
+  if (!assignmentId) {
+    throw new Error('uploadAssignmentAsset requires `assignmentId`.');
+  }
+
+  if (!fileName) {
+    throw new Error('uploadAssignmentAsset requires `fileName`.');
+  }
+
+  if (!fileContentBase64) {
+    throw new Error('uploadAssignmentAsset requires `fileContentBase64`.');
+  }
+
+  if (fileSize > MAX_BROWSER_UPLOAD_SIZE_BYTES) {
+    throw new Error('檔案超過目前直傳上限 18 MB。');
+  }
+
+  var currentUser = state.Users.find(function(user) {
+    return user.User_ID === userId;
+  });
+  if (!currentUser) {
+    throw new Error('User not found: ' + userId);
+  }
+
+  var assignment = ensureArray_(state.Assignments).find(function(item) {
+    return String(item.Assignment_ID || '') === assignmentId;
+  });
+  if (!assignment) {
+    throw new Error('Assignment not found: ' + assignmentId);
+  }
+
+  var effectiveTeamId = teamId || currentUser.Team_ID;
+  if (!effectiveTeamId || effectiveTeamId === 'T00') {
+    throw new Error('Only approved teams can submit assignment attachments.');
+  }
+
+  if (getAssignmentTargetTeamIds_(state, assignment).indexOf(effectiveTeamId) === -1) {
+    throw new Error('這份作業不在此小組的目標範圍內。');
+  }
+
+  var stage = ensureArray_(state.Config_Stages).find(function(item) {
+    return String(item.Stage_ID || '') === String(assignment.Stage_ID || '');
+  }) || ensureArray_(state.Config_Stages).find(function(item) {
+    return item.Is_Active === true;
+  });
+  if (!stage) {
+    throw new Error('找不到對應的會審期數。');
+  }
+
+  var team = ensureArray_(state.Teams).find(function(item) {
+    return String(item.Team_ID || '') === effectiveTeamId;
+  });
+  if (!team) {
+    throw new Error('Team not found: ' + effectiveTeamId);
+  }
+
+  var parsedFile = parseFileMeta_(fileName);
+  var extension = String(parsedFile.extension || '').trim();
+  if (!extension) {
+    throw new Error('檔案名稱需包含副檔名。');
+  }
+
+  if (!isSupportedUploadExtension_(extension)) {
+    throw new Error('目前只支援 ai、pdf、psd、indd、圖像格式與 zip。');
+  }
+
+  var existingSubmissions = ensureArray_(state.Assignment_Submissions).filter(function(submission) {
+    return String(submission.Assignment_ID || '') === assignment.Assignment_ID
+      && String(submission.Team_ID || '') === effectiveTeamId;
+  });
+  var latestSubmission = existingSubmissions.slice().sort(function(a, b) {
+    var numberDiff = Number(b.Submission_No || 1) - Number(a.Submission_No || 1);
+    if (numberDiff !== 0) return numberDiff;
+    return new Date(b.Submitted_At).getTime() - new Date(a.Submitted_At).getTime();
+  })[0] || null;
+
+  if (latestSubmission && assignment.Allow_ReSubmit !== true) {
+    throw new Error('此作業目前不開放重新繳交。');
+  }
+
+  var nextSubmissionNo = latestSubmission ? Number(latestSubmission.Submission_No || 1) + 1 : 1;
+  var storedFileName = buildAssignmentSubmissionFileName_(fileName, nextSubmissionNo);
+  var driveResult = createDriveFileFromBase64_(
+    fileContentBase64,
+    mimeType,
+    fileName,
+    [stage.Stage_Name, team.Team_Name, '公告作業', assignment.Title],
+    storedFileName
+  );
+
+  return {
+    assignmentId: assignment.Assignment_ID,
+    fileName: driveResult.fileName,
+    fileUrl: driveResult.fileUrl,
+    driveFileId: driveResult.fileId,
+    driveFolderId: driveResult.folderId,
+    drive: driveResult
+  };
+}
+
+function handleLargeFileFormUpload_(payload) {
+  var state = loadState_();
+  var userId = String(payload.userId || '').trim();
+  var stageId = String(payload.stageId || '').trim();
+  var teamId = String(payload.teamId || '').trim();
+  var groupKey = String(payload.groupKey || '').trim();
+  var baseName = String(payload.baseName || '').trim();
+  var sourceFileName = String(payload.sourceFileName || '').trim();
+  var extension = String(payload.extension || '').trim();
+  var sessionKey = String(payload.sessionKey || '').trim();
+  var blob = resolveUploadBlob_(payload.uploadFile);
+  var fileSize = getBlobSizeBytes_(blob);
+  var actualFileName = sanitizeDriveEntryName_(blob.getName && blob.getName(), sourceFileName || 'upload.bin');
+  var parsedActualFile = parseFileMeta_(actualFileName);
+
+  if (!userId) {
+    throw new Error('穩定上傳缺少 userId。');
+  }
+
+  if (fileSize > MAX_STABLE_WEBAPP_UPLOAD_SIZE_BYTES) {
+    throw new Error('檔案超過穩定上傳頁 50 MB 上限。');
+  }
+
+  var currentUser = state.Users.find(function(user) {
+    return user.User_ID === userId;
+  });
+  if (!currentUser) {
+    throw new Error('User not found: ' + userId);
+  }
+
+  var effectiveTeamId = teamId || currentUser.Team_ID;
+  if (!effectiveTeamId || effectiveTeamId === 'T00') {
+    throw new Error('Only approved teams can submit assignment attachments.');
+  }
+
+  var activeStage = stageId
+    ? state.Config_Stages.find(function(stage) { return stage.Stage_ID === stageId; })
+    : state.Config_Stages.find(function(stage) { return stage.Is_Active === true; });
+  if (!activeStage) {
+    throw new Error('No active stage found for upload.');
+  }
+
+  var team = state.Teams.find(function(item) {
+    return item.Team_ID === effectiveTeamId;
+  });
+  if (!team) {
+    throw new Error('Team not found: ' + effectiveTeamId);
+  }
+
+  var resolvedBaseName = String(baseName || parsedActualFile.baseName || '').trim();
+  var resolvedExtension = String(extension || parsedActualFile.extension || '').trim();
+  if (!resolvedBaseName) {
+    throw new Error('檔案主名稱不可為空白。');
+  }
+  if (!resolvedExtension) {
+    throw new Error('檔案名稱需包含副檔名。');
+  }
+  if (!isSupportedUploadExtension_(resolvedExtension)) {
+    throw new Error('目前只支援 ai、pdf、psd、indd、圖像格式與 zip。');
+  }
+
+  var resolvedGroupKey = String(groupKey || makeFileGroupKey_(activeStage.Stage_ID, effectiveTeamId, resolvedBaseName)).trim();
+  var latestFile = getLatestFileForGroup_(state.Files, resolvedGroupKey);
+  if (latestFile && latestFile.Check_Status !== '退件') {
+    throw new Error('Only rejected attachments can be resubmitted.');
+  }
+
+  var relatedFiles = state.Files.filter(function(file) {
+    return file.File_Group_Key === resolvedGroupKey;
+  });
+  var highestVersion = relatedFiles.reduce(function(max, file) {
+    return Math.max(max, Number(file.Version_No || 1));
+  }, 0);
+  var nextVersion = highestVersion + 1;
+  var storedFileName = buildVersionedFileName_(resolvedBaseName, nextVersion, resolvedExtension);
+  var uploadNote = latestFile ? '退件後重新繳交' : '首次繳交';
+  var driveResult = createDriveFileFromBlob_(blob, [activeStage.Stage_Name, team.Team_Name], storedFileName);
+  var uploadTime = nowString_();
+  var nextFileId = generateSequentialId_('F', state.Files, 'File_ID');
+
+  var createdFile = hydrateFileRecord_({
+    File_ID: nextFileId,
+    Stage_ID: activeStage.Stage_ID,
+    Team_ID: effectiveTeamId,
+    File_Name: storedFileName,
+    Google_Drive_URL: driveResult.fileUrl,
+    Upload_Time: uploadTime,
+    Check_Status: '未審',
+    Comment: '',
+    Base_File_Name: resolvedBaseName,
+    File_Extension: resolvedExtension,
+    Version_No: nextVersion,
+    File_Group_Key: resolvedGroupKey,
+    Revision_Notes: uploadNote,
+    Drive_File_ID: driveResult.fileId,
+    Drive_Folder_ID: driveResult.folderId
+  });
+
+  state.Files.unshift(createdFile);
+  refreshFileVersionMetadata_(state.Files);
+
+  createNotifications_(state, {
+    type: nextVersion > 1 ? 'file-version' : 'file-upload',
+    title: team.Team_Name + ' 已送出附件',
+    message: '「' + storedFileName + '」已進入 ' + activeStage.Stage_Name + ' 繳交流程。',
+    tab: 'files',
+    refType: 'file',
+    refId: nextFileId,
+    audience: {
+      roles: ['SuperAdmin', 'Admin'],
+      teamIds: [effectiveTeamId]
+    },
+    createdAt: uploadTime,
+    priority: nextVersion > 1 ? 'high' : 'normal'
+  });
+
+  persistState_(state);
+
+  return {
+    status: 'success',
+    mode: 'file',
+    sessionKey: sessionKey,
+    fileId: createdFile.File_ID,
+    fileName: createdFile.File_Name,
+    fileUrl: createdFile.Google_Drive_URL,
+    driveFileId: driveResult.fileId,
+    driveFolderId: driveResult.folderId,
+    folderPath: driveResult.folderPath,
+    uploadedAt: uploadTime
+  };
+}
+
+function handleLargeAssignmentAssetFormUpload_(payload) {
+  var state = loadState_();
+  var userId = String(payload.userId || '').trim();
+  var assignmentId = String(payload.assignmentId || '').trim();
+  var teamId = String(payload.teamId || '').trim();
+  var sessionKey = String(payload.sessionKey || '').trim();
+  var sourceFileName = String(payload.sourceFileName || '').trim();
+  var blob = resolveUploadBlob_(payload.uploadFile);
+  var fileSize = getBlobSizeBytes_(blob);
+  var actualFileName = sanitizeDriveEntryName_(blob.getName && blob.getName(), sourceFileName || 'upload.bin');
+  var parsedFile = parseFileMeta_(actualFileName);
+  var extension = String(parsedFile.extension || '').trim();
+
+  if (!userId) {
+    throw new Error('穩定上傳缺少 userId。');
+  }
+  if (!assignmentId) {
+    throw new Error('穩定上傳缺少 assignmentId。');
+  }
+  if (fileSize > MAX_STABLE_WEBAPP_UPLOAD_SIZE_BYTES) {
+    throw new Error('檔案超過穩定上傳頁 50 MB 上限。');
+  }
+  if (!extension) {
+    throw new Error('檔案名稱需包含副檔名。');
+  }
+  if (!isSupportedUploadExtension_(extension)) {
+    throw new Error('目前只支援 ai、pdf、psd、indd、圖像格式與 zip。');
+  }
+
+  var currentUser = state.Users.find(function(user) {
+    return user.User_ID === userId;
+  });
+  if (!currentUser) {
+    throw new Error('User not found: ' + userId);
+  }
+
+  var assignment = ensureArray_(state.Assignments).find(function(item) {
+    return String(item.Assignment_ID || '') === assignmentId;
+  });
+  if (!assignment) {
+    throw new Error('Assignment not found: ' + assignmentId);
+  }
+
+  var effectiveTeamId = teamId || currentUser.Team_ID;
+  if (!effectiveTeamId || effectiveTeamId === 'T00') {
+    throw new Error('Only approved teams can submit assignment attachments.');
+  }
+  if (getAssignmentTargetTeamIds_(state, assignment).indexOf(effectiveTeamId) === -1) {
+    throw new Error('這份作業不在此小組的目標範圍內。');
+  }
+
+  var stage = ensureArray_(state.Config_Stages).find(function(item) {
+    return String(item.Stage_ID || '') === String(assignment.Stage_ID || '');
+  }) || ensureArray_(state.Config_Stages).find(function(item) {
+    return item.Is_Active === true;
+  });
+  if (!stage) {
+    throw new Error('找不到對應的會審期數。');
+  }
+
+  var team = ensureArray_(state.Teams).find(function(item) {
+    return String(item.Team_ID || '') === effectiveTeamId;
+  });
+  if (!team) {
+    throw new Error('Team not found: ' + effectiveTeamId);
+  }
+
+  var existingSubmissions = ensureArray_(state.Assignment_Submissions).filter(function(submission) {
+    return String(submission.Assignment_ID || '') === assignment.Assignment_ID
+      && String(submission.Team_ID || '') === effectiveTeamId;
+  });
+  var latestSubmission = existingSubmissions.slice().sort(function(a, b) {
+    var numberDiff = Number(b.Submission_No || 1) - Number(a.Submission_No || 1);
+    if (numberDiff !== 0) return numberDiff;
+    return new Date(b.Submitted_At).getTime() - new Date(a.Submitted_At).getTime();
+  })[0] || null;
+
+  if (latestSubmission && assignment.Allow_ReSubmit !== true) {
+    throw new Error('此作業目前不開放重新繳交。');
+  }
+
+  var nextSubmissionNo = latestSubmission ? Number(latestSubmission.Submission_No || 1) + 1 : 1;
+  var storedFileName = buildAssignmentSubmissionFileName_(actualFileName, nextSubmissionNo);
+  var driveResult = createDriveFileFromBlob_(
+    blob,
+    [stage.Stage_Name, team.Team_Name, '公告作業', assignment.Title],
+    storedFileName
+  );
+
+  return {
+    status: 'success',
+    mode: 'assignment-asset',
+    sessionKey: sessionKey,
+    assignmentId: assignment.Assignment_ID,
+    fileName: driveResult.fileName,
+    sourceFileName: actualFileName,
+    fileUrl: driveResult.fileUrl,
+    driveFileId: driveResult.fileId,
+    driveFolderId: driveResult.folderId,
+    folderPath: driveResult.folderPath,
+    uploadedAt: nowString_()
+  };
 }
 
 function handleReviewFile_(payload) {
@@ -1958,12 +3006,12 @@ function routeDriveFile_(driveUrl, stageName, teamName, targetFileName) {
   }
 
   var rootFolder = DriveApp.getFolderById(config.driveRootFolderId);
-  var stageFolder = getOrCreateFolder_(rootFolder, stageName);
-  var teamFolder = getOrCreateFolder_(stageFolder, teamName);
+  var folderContext = getOrCreateNestedFolders_(rootFolder, [stageName, teamName]);
+  var teamFolder = folderContext.folder;
   var file = DriveApp.getFileById(fileId);
 
   try {
-    file.setName(targetFileName);
+    file.setName(sanitizeDriveEntryName_(targetFileName, file.getName()));
     file.moveTo(teamFolder);
   } catch (error) {
     throw new Error('Drive file move failed. Please confirm the script has edit access to the file. Original error: ' + error.message);
@@ -1974,7 +3022,64 @@ function routeDriveFile_(driveUrl, stageName, teamName, targetFileName) {
     fileUrl: file.getUrl(),
     folderId: teamFolder.getId(),
     folderName: teamFolder.getName(),
-    folderPath: [rootFolder.getName(), stageFolder.getName(), teamFolder.getName()].join(' / ')
+    folderPath: folderContext.path,
+    fileName: file.getName()
+  };
+}
+
+function resolveUploadBlob_(blob) {
+  if (!blob || typeof blob.getBytes !== 'function') {
+    throw new Error('找不到上傳檔案內容，請重新選擇檔案後再試。');
+  }
+  return blob;
+}
+
+function getBlobSizeBytes_(blob) {
+  return resolveUploadBlob_(blob).getBytes().length;
+}
+
+function createDriveFileFromBase64_(fileContentBase64, mimeType, sourceFileName, folderSegments, targetFileName) {
+  var base64 = String(fileContentBase64 || '').trim();
+  if (!base64) {
+    throw new Error('Missing `fileContentBase64`.');
+  }
+
+  var resolvedSourceFileName = sanitizeDriveEntryName_(sourceFileName, 'upload.bin');
+  var resolvedTargetFileName = sanitizeDriveEntryName_(targetFileName, resolvedSourceFileName);
+  var resolvedMimeType = String(mimeType || 'application/octet-stream').trim() || 'application/octet-stream';
+  var config = getConfig_();
+  var rootFolder = DriveApp.getFolderById(config.driveRootFolderId);
+  var folderContext = getOrCreateNestedFolders_(rootFolder, folderSegments);
+  var blob = Utilities.newBlob(Utilities.base64Decode(base64), resolvedMimeType, resolvedTargetFileName);
+  var file = folderContext.folder.createFile(blob);
+
+  return {
+    fileId: file.getId(),
+    fileUrl: file.getUrl(),
+    fileName: file.getName(),
+    folderId: folderContext.folder.getId(),
+    folderName: folderContext.folder.getName(),
+    folderPath: folderContext.path
+  };
+}
+
+function createDriveFileFromBlob_(blob, folderSegments, targetFileName) {
+  var resolvedBlob = resolveUploadBlob_(blob);
+  var resolvedTargetFileName = sanitizeDriveEntryName_(targetFileName, resolvedBlob.getName && resolvedBlob.getName());
+  var contentType = String(resolvedBlob.getContentType && resolvedBlob.getContentType() || 'application/octet-stream').trim() || 'application/octet-stream';
+  var config = getConfig_();
+  var rootFolder = DriveApp.getFolderById(config.driveRootFolderId);
+  var folderContext = getOrCreateNestedFolders_(rootFolder, folderSegments);
+  var driveBlob = Utilities.newBlob(resolvedBlob.getBytes(), contentType, resolvedTargetFileName);
+  var file = folderContext.folder.createFile(driveBlob);
+
+  return {
+    fileId: file.getId(),
+    fileUrl: file.getUrl(),
+    fileName: file.getName(),
+    folderId: folderContext.folder.getId(),
+    folderName: folderContext.folder.getName(),
+    folderPath: folderContext.path
   };
 }
 
@@ -2000,7 +3105,7 @@ function extractDriveFileId_(driveUrl) {
 }
 
 function getOrCreateFolder_(parentFolder, folderName) {
-  var targetName = String(folderName || '').trim();
+  var targetName = sanitizeDriveEntryName_(folderName);
   if (!targetName) {
     throw new Error('Folder name is required.');
   }
@@ -2011,6 +3116,25 @@ function getOrCreateFolder_(parentFolder, folderName) {
   }
 
   return parentFolder.createFolder(targetName);
+}
+
+function getOrCreateNestedFolders_(rootFolder, folderSegments) {
+  var currentFolder = rootFolder;
+  var pathNames = [rootFolder.getName()];
+
+  ensureArray_(folderSegments).forEach(function(segment) {
+    var folderName = sanitizeDriveEntryName_(segment);
+    if (!folderName) {
+      return;
+    }
+    currentFolder = getOrCreateFolder_(currentFolder, folderName);
+    pathNames.push(currentFolder.getName());
+  });
+
+  return {
+    folder: currentFolder,
+    path: pathNames.join(' / ')
+  };
 }
 
 function createNotifications_(state, payload) {
@@ -2095,6 +3219,119 @@ function resolveNotificationRecipients_(state, audience) {
 function formatDateTime_(dateValue) {
   var config = getConfig_();
   return Utilities.formatDate(new Date(dateValue), config.timeZone, 'yyyy-MM-dd HH:mm');
+}
+
+function formatCompactDateTimeLabel_(value) {
+  var raw = String(value || '').trim();
+  if (!raw) {
+    return '';
+  }
+
+  var simpleMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?/);
+  if (simpleMatch) {
+    var year = simpleMatch[1];
+    var month = simpleMatch[2];
+    var day = simpleMatch[3];
+    var hour = simpleMatch[4];
+    var minute = simpleMatch[5];
+    if (hour && minute) {
+      return year + '/' + month + '/' + day + ' ' + hour + ':' + minute;
+    }
+    return year + '/' + month + '/' + day;
+  }
+
+  var parsed = new Date(raw);
+  if (!isNaN(parsed.getTime())) {
+    var config = getConfig_();
+    return Utilities.formatDate(parsed, config.timeZone, 'yyyy/MM/dd HH:mm');
+  }
+
+  return raw;
+}
+
+function normalizeDateTimeStorageValue_(value) {
+  var raw = String(value || '').trim();
+  if (!raw) {
+    return '';
+  }
+
+  var simpleMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?/);
+  if (simpleMatch) {
+    var year = simpleMatch[1];
+    var month = simpleMatch[2];
+    var day = simpleMatch[3];
+    var hour = simpleMatch[4] || '00';
+    var minute = simpleMatch[5] || '00';
+    return year + '-' + month + '-' + day + ' ' + hour + ':' + minute;
+  }
+
+  var parsed = new Date(raw);
+  if (!isNaN(parsed.getTime())) {
+    return formatDateTime_(parsed);
+  }
+
+  return raw;
+}
+
+function normalizeEmbeddedDateTimes_(text) {
+  var raw = String(text || '');
+  if (!raw) {
+    return '';
+  }
+
+  return raw.replace(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\s+\d{2}:\d{2}:\d{2}\s+GMT[+-]\d{4}(?:\s+\([^)]+\))?|(?:\d{4})-(?:\d{2})-(?:\d{2})(?:[ T]\d{2}:\d{2}(?::\d{2})?)/g, function(match) {
+    return formatCompactDateTimeLabel_(match);
+  });
+}
+
+function buildNotificationNormalizationFingerprint_(notification) {
+  return JSON.stringify({
+    Notification_ID: String(notification && notification.Notification_ID || ''),
+    User_ID: String(notification && notification.User_ID || ''),
+    Type: String(notification && notification.Type || ''),
+    Title: String(notification && notification.Title || ''),
+    Message: String(notification && notification.Message || ''),
+    Created_At: String(notification && notification.Created_At || ''),
+    Read: Boolean(notification && notification.Read),
+    Tab: String(notification && notification.Tab || ''),
+    Ref_Type: String(notification && notification.Ref_Type || ''),
+    Ref_ID: String(notification && notification.Ref_ID || ''),
+    Priority: String(notification && notification.Priority || '')
+  });
+}
+
+function getTimeZoneOffsetString_(timeZone) {
+  var offsetRaw = Utilities.formatDate(new Date(), timeZone, 'Z');
+  if (!offsetRaw || offsetRaw.length !== 5) {
+    return '+00:00';
+  }
+  return offsetRaw.slice(0, 3) + ':' + offsetRaw.slice(3);
+}
+
+function parseConfiguredDateTime_(dateTimeText) {
+  var raw = String(dateTimeText || '').trim();
+  var match = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?$/);
+  if (!match) {
+    return null;
+  }
+
+  var config = getConfig_();
+  var isoText = [
+    match[1],
+    '-',
+    match[2],
+    '-',
+    match[3],
+    'T',
+    match[4] || '00',
+    ':',
+    match[5] || '00',
+    ':00',
+    getTimeZoneOffsetString_(config.timeZone)
+  ].join('');
+
+  var parsed = new Date(isoText);
+  return isNaN(parsed.getTime()) ? null : parsed;
 }
 
 function nowString_() {
@@ -2410,10 +3647,10 @@ function buildDemoState_() {
       {
         Assignment_ID: 'A01',
         Stage_ID: 'S02',
-        Title: '第二次會審公告｜主視覺定稿與文字說明',
-        Body: '請各小組依照第二次會審要求，提交主視覺定稿檔案與 100 字內的說明文字。若有需要，也可以附上雲端預覽連結。',
+        Title: '第二次會審繳交項目｜主視覺定稿與文字說明',
+        Body: '請各小組依照第二次會審要求，直接上傳主視覺定稿檔案，並附上 100 字內的說明文字。',
         Submission_Mode: 'file-text',
-        Requirement_Text: '需繳交作業附件、Google Drive 連結與簡短說明文字。',
+        Requirement_Text: '需直接上傳作業附件，並附上簡短說明文字。',
         Target_Mode: 'all',
         Target_Team_IDs: ['T01', 'T02'],
         Due_At: '2026-07-10 23:59',
@@ -2425,7 +3662,7 @@ function buildDemoState_() {
       {
         Assignment_ID: 'A02',
         Stage_ID: 'S02',
-        Title: '作業公告｜印刷前自我檢查表',
+        Title: '繳交項目｜印刷前自我檢查表',
         Body: '請各組完成 Pre-flight Checklist，確認字體、色彩模式、出血與解析度都已處理完成後再繳交。',
         Submission_Mode: 'text',
         Requirement_Text: '請直接回覆檢查結果與自評說明文字即可。',
@@ -2497,7 +3734,7 @@ function buildDemoState_() {
         User_ID: 'U01',
         Type: 'file-upload',
         Title: 'B組上傳新檔案',
-        Message: '「宣傳酷卡背面V3.ai」已送交第二次會審，請前往公告作業區查看。',
+        Message: '「宣傳酷卡背面V3.ai」已送交第二次會審，請前往繳交專區查看。',
         Created_At: '2026-07-02 10:15',
         Read: false,
         Tab: 'files',
@@ -2510,7 +3747,7 @@ function buildDemoState_() {
         User_ID: 'U02',
         Type: 'file-upload',
         Title: 'B組上傳新檔案',
-        Message: '「宣傳酷卡背面V3.ai」已送交第二次會審，請前往公告作業區查看。',
+        Message: '「宣傳酷卡背面V3.ai」已送交第二次會審，請前往繳交專區查看。',
         Created_At: '2026-07-02 10:15',
         Read: false,
         Tab: 'files',
@@ -2548,8 +3785,8 @@ function buildDemoState_() {
         Notification_ID: 'N05',
         User_ID: 'U03',
         Type: 'assignment-post',
-        Title: '新作業公告：主視覺定稿與文字說明',
-        Message: '「第二次會審公告｜主視覺定稿與文字說明」已發布，請前往公告作業區查看與繳交。',
+        Title: '新繳交項目：主視覺定稿與文字說明',
+        Message: '「第二次會審繳交項目｜主視覺定稿與文字說明」已發布，請前往繳交專區查看與繳交。',
         Created_At: '2026-07-02 18:00',
         Read: false,
         Tab: 'files',
@@ -2561,8 +3798,8 @@ function buildDemoState_() {
         Notification_ID: 'N06',
         User_ID: 'U04',
         Type: 'assignment-post',
-        Title: '新作業公告：主視覺定稿與文字說明',
-        Message: '「第二次會審公告｜主視覺定稿與文字說明」已發布，請前往公告作業區查看與繳交。',
+        Title: '新繳交項目：主視覺定稿與文字說明',
+        Message: '「第二次會審繳交項目｜主視覺定稿與文字說明」已發布，請前往繳交專區查看與繳交。',
         Created_At: '2026-07-02 18:00',
         Read: false,
         Tab: 'files',
@@ -2572,7 +3809,14 @@ function buildDemoState_() {
       }
     ],
     Meta: {
-      NotificationSeeded: true
+      NotificationSeeded: true,
+      AssignmentReminderSettings: {
+        enabled: true,
+        offsetsHours: [72, 24, 6],
+        sendEmail: true,
+        sendSiteNotifications: true
+      },
+      AssignmentReminderLog: {}
     }
   });
 }

@@ -22,11 +22,13 @@
 - `doGet(e)`
   - `action=health`：檢查設定是否正常
   - `action=bootstrap`：回傳完整 `state`
+  - `action=largeUploadPage`：開啟大檔穩定上傳頁
 - `doPost(e)`
   - `action=setup`：建立工作表，可選 `seedDemo: true`
   - `action=login` / `registerLeader` / `registerMember` / `activatePending`
   - `action=saveState`：整包回寫目前前端 state
-  - `action=uploadFile`：建立/續版繳交紀錄，並把 Drive 檔案搬到 `會審 / 小組` 資料夾
+- `action=uploadFile`：接收瀏覽器直傳檔案，建立/續版繳交紀錄，並自動存到 `會審 / 小組` 資料夾
+- `action=uploadAssignmentAsset`：接收公告作業直傳檔案，並自動存到 `會審 / 小組 / 公告作業 / 作業標題` 資料夾
   - `action=reviewFile`：更新審核狀態並產生通知
   - `action=markNotificationsRead`
   - `action=clearNotifications`
@@ -34,9 +36,26 @@
   - `action=previewPasswordReset`：驗證重設 token 是否有效
   - `action=resetPassword`：更新使用者密碼
 
+## 背景自動催交
+
+這版已加入 GAS 背景排程提醒：
+
+- 不需要有人開著網站
+- 由 GAS installable trigger 每小時自動掃描一次
+- 針對「尚未繳交」的小組發送：
+  - 站內通知
+  - Email 催交提醒
+- 預設提醒節點：
+  - 截止前 `72` 小時
+  - 截止前 `24` 小時
+  - 截止前 `6` 小時
+  - 截止後第一次掃描時補一封逾期提醒
+
+提醒紀錄會寫進 `Meta.AssignmentReminderLog`，避免同一個節點重複寄送。
+
 ## 部署步驟
 
-1. 在 Apps Script 專案中放入 [Code.gs](</Users/james/Documents/Image Design/gas/Code.gs>) 和 [appsscript.json](</Users/james/Documents/Image Design/gas/appsscript.json>)。
+1. 在 Apps Script 專案中放入 [Code.gs](</Users/james/Documents/Image Design/gas/Code.gs>)、[LargeUpload.html](</Users/james/Documents/Image Design/gas/LargeUpload.html>) 和 [appsscript.json](</Users/james/Documents/Image Design/gas/appsscript.json>)。
 2. 建立一份 Google 試算表，記下 Spreadsheet ID。
 3. 在 Google Drive 建立一個總資料夾，作為所有會審檔案的根目錄，記下 Folder ID。
 4. 在 Apps Script 執行：
@@ -51,6 +70,7 @@ saveScriptConfig('你的 Spreadsheet ID', '你的 Drive Root Folder ID', {
 });
 setupSheets();
 authorizeMailScope();
+enableAssignmentReminderAutomation();
 ```
 
 `frontendBaseUrl` 請填你實際開啟這個前端頁面的網址，例如：
@@ -69,6 +89,25 @@ seedDemoData();
 6. 部署成 Web App。
    - Execute as: `Me`
    - Who has access: `Anyone`
+
+7. 第一次完成授權後，請確認背景 trigger 已建立。
+   你可以在 Apps Script 執行：
+
+```javascript
+listAssignmentReminderTriggers();
+```
+
+若要重裝 trigger，可執行：
+
+```javascript
+installAssignmentReminderTrigger();
+```
+
+若要暫停背景催交：
+
+```javascript
+disableAssignmentReminderAutomation();
+```
 
 ## 請求範例
 
@@ -94,7 +133,9 @@ GET https://script.google.com/macros/s/你的部署ID/exec?action=bootstrap
   "action": "uploadFile",
   "userId": "U03",
   "fileName": "主視覺海報_定案V2.pdf",
-  "googleDriveUrl": "https://drive.google.com/file/d/你的檔案ID/view"
+  "mimeType": "application/pdf",
+  "fileSize": 1048576,
+  "fileContentBase64": "JVBERi0xLjQKJ..."
 }
 ```
 
@@ -145,11 +186,16 @@ GET https://script.google.com/macros/s/你的部署ID/exec?action=bootstrap
 - 首次載入：呼叫 `GET action=bootstrap`
 - 每次本地 state 有變更：呼叫 `POST action=saveState`
 
-如果要把作業繳交流程切成真正的後端自動化，再把目前前端的假模擬上傳改成 `POST action=uploadFile`。
+如果要把一般檔案收件和公告作業都接到雲端，目前直接用：
+
+- `POST action=uploadFile`
+- `POST action=uploadAssignmentAsset`
+- `GET action=largeUploadPage`：給 18 MB 以上的大檔改走穩定上傳頁
 
 ## 注意
 
-- `uploadFile` 目前吃的是「Google Drive 檔案連結」，不是瀏覽器直接上傳二進位檔。
-- GAS 必須對該 Drive 檔案有可編輯權限，才能搬移與重新命名。
+- `uploadFile` / `uploadAssignmentAsset` 現在吃的是瀏覽器直傳的 base64 二進位內容，不再需要先貼 Google Drive 連結。
+- 主頁目前維持單檔 `18 MB` 內直傳；超過 `18 MB` 時，前端會改開 `largeUploadPage`，由 GAS HTML Service 走較穩定的上傳頁流程，最高約 `50 MB`。
+- 公告作業的背景催交信目前會沿用作業上的 `Notify_By_Email` 設定；若該公告建立時有勾選寄送 Email，後續背景提醒也會一起寄出。
 - 如果前端頁面目前是直接用 `file://` 開啟，之後真接 Web App API 時，建議改成放在靜態站或同樣由 GAS/網頁伺服器提供，避免瀏覽器跨來源限制。
 - 密碼重設信的連結會依據 `FRONTEND_BASE_URL` 組成；若沒設定，`requestPasswordReset` 會直接報錯。

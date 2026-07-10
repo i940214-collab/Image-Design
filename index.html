@@ -846,7 +846,7 @@
                     </div>
                     <div>
                         <label class="block text-xs font-semibold text-[#1D1D1F] mb-1.5">設定密碼</label>
-                        <input type="password" id="reg-leader-pwd" required class="w-full px-4 py-3 rounded-xl border border-[#E8E8ED] focus:outline-none focus:border-[#0066CC] transition text-sm" placeholder="密碼最少為 3 碼">
+                        <input type="password" id="reg-leader-pwd" required minlength="8" class="w-full px-4 py-3 rounded-xl border border-[#E8E8ED] focus:outline-none focus:border-[#0066CC] transition text-sm" placeholder="密碼最少為 8 碼">
                     </div>
                     <button type="submit" class="w-full bg-[#1D1D1F] text-white py-3 rounded-xl font-semibold text-sm hover:opacity-90 transition active:scale-[0.99] shadow-sm">
                         建立新組別並註冊為組長
@@ -869,7 +869,7 @@
                     </div>
                     <div>
                         <label class="block text-xs font-semibold text-[#1D1D1F] mb-1.5">設定密碼</label>
-                        <input type="password" id="reg-member-pwd" required class="w-full px-4 py-3 rounded-xl border border-[#E8E8ED] focus:outline-none focus:border-[#0066CC] transition text-sm" placeholder="設定登入密碼">
+                        <input type="password" id="reg-member-pwd" required minlength="8" class="w-full px-4 py-3 rounded-xl border border-[#E8E8ED] focus:outline-none focus:border-[#0066CC] transition text-sm" placeholder="設定至少 8 碼的登入密碼">
                     </div>
                     <button type="submit" class="w-full bg-[#0066CC] text-white py-3 rounded-xl font-semibold text-sm hover:opacity-95 transition active:scale-[0.99] shadow-sm">
                         加入該組並註冊
@@ -891,7 +891,7 @@
                     </div>
                     <div>
                         <label class="block text-xs font-semibold text-[#1D1D1F] mb-1.5">設定密碼</label>
-                        <input type="password" id="reg-pending-pwd" required class="w-full px-4 py-3 rounded-xl border border-[#E8E8ED] focus:outline-none focus:border-[#0066CC] text-sm" placeholder="設定首次登入密碼">
+                        <input type="password" id="reg-pending-pwd" required minlength="8" class="w-full px-4 py-3 rounded-xl border border-[#E8E8ED] focus:outline-none focus:border-[#0066CC] text-sm" placeholder="設定至少 8 碼的首次登入密碼">
                     </div>
                     <button type="submit" class="w-full bg-[#1D1D1F] text-white py-3 rounded-xl font-semibold text-sm hover:opacity-90 transition active:scale-[0.99] shadow-sm">
                         確認設定並激活帳號
@@ -924,7 +924,7 @@
                 <div id="reset-password-fields" class="space-y-4 hidden">
                     <div>
                         <label class="block text-xs font-semibold text-[#1D1D1F] mb-1.5">新密碼</label>
-                        <input type="password" id="reset-password-next" class="w-full px-4 py-3 rounded-xl border border-[#E8E8ED] focus:outline-none focus:border-[#0066CC] transition text-sm" placeholder="至少 3 碼">
+                        <input type="password" id="reset-password-next" minlength="8" class="w-full px-4 py-3 rounded-xl border border-[#E8E8ED] focus:outline-none focus:border-[#0066CC] transition text-sm" placeholder="至少 8 碼">
                     </div>
                     <div>
                         <label class="block text-xs font-semibold text-[#1D1D1F] mb-1.5">再次確認新密碼</label>
@@ -1405,6 +1405,7 @@
         let remoteSaveTimer = null;
         let remoteSaveInFlight = false;
         let pendingRemoteSave = false;
+        let pendingPurchaseDeletionIds = new Set();
         let gasModalLastResult = "idle";
         let gasConnectionStatus = "local";
         let authScreenMode = "login";
@@ -1417,6 +1418,12 @@
         let passwordResetExpiresAt = "";
         let passwordResetErrorMessage = "";
         let loginSubmitInFlight = false;
+        let authSessionToken = "";
+        let remoteStateRevision = 0;
+        let activityLogs = [];
+        let activityLogStatus = "idle";
+        let activityLogErrorMessage = "";
+        let activityLogFilter = "all";
         let siteInfoModalMode = "privacy";
         let activeSoftSelectId = "";
         let softSelectInteractionsBound = false;
@@ -1428,6 +1435,7 @@
             { id: "notifications", name: "通知中心", icon: "bell", roles: ["SuperAdmin", "Admin", "Leader", "Member"] },
             { id: "files", name: "繳交專區", icon: "clipboard-list", roles: ["SuperAdmin", "Admin", "Leader", "Member"] },
             { id: "purchase", name: "印刷品登記", icon: "printer", roles: ["SuperAdmin", "Admin", "Leader", "Member"] },
+            { id: "activity", name: "操作紀錄", icon: "scroll-text", roles: ["SuperAdmin", "Admin"] },
             { id: "teams", name: "小組與成員", icon: "users", roles: ["SuperAdmin", "Leader", "Member"] },
             { id: "stages", name: "會審期數設定", icon: "settings", roles: ["SuperAdmin"] }
         ];
@@ -2244,17 +2252,19 @@
             setBootLoaderPhase("preparing");
 
             try {
+                const storedSession = getStoredSession();
+                authSessionToken = storedSession && storedSession.sessionToken
+                    ? String(storedSession.sessionToken)
+                    : "";
+                if (storedSession && !authSessionToken) {
+                    clearStoredSession();
+                }
                 await loadState();
                 setBootLoaderPhase("auth");
 
-                const storedSession = getStoredSession();
-                if (storedSession && storedSession.userId) {
-                    currentUser = pickCurrentUser(storedSession.userId, { allowFallback: false });
-                    if (currentUser) {
-                        activeWorkspace = resolveWorkspaceForUser(currentUser, storedSession.workspace);
-                    } else {
-                        clearStoredSession();
-                    }
+                if (currentUser && storedSession) {
+                    activeWorkspace = resolveWorkspaceForUser(currentUser, storedSession.workspace);
+                    persistCurrentSession();
                 }
 
                 await initializePasswordResetFlowFromUrl();
@@ -2396,25 +2406,37 @@
 
         async function loadState() {
             const saved = localStorage.getItem(STORAGE_KEY);
-            let hasUsableLocalState = false;
             gasConnectionStatus = isRemoteSyncEnabled() ? "connecting" : "local";
             setBootLoaderPhase("cache");
-            state = cloneStateSnapshot(DEFAULT_STATE);
-            if (saved) {
-                try {
-                    state = JSON.parse(saved);
-                    hasUsableLocalState = true;
-                } catch(e) {
-                    console.error("解析 LocalStorage 失敗", e);
-                }
-            }
-            normalizeStateSchema();
-            seedInitialNotificationsIfNeeded();
-            runStateAutomations();
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 
             if (!isRemoteSyncEnabled()) {
+                state = cloneStateSnapshot(DEFAULT_STATE);
+                if (saved) {
+                    try {
+                        state = JSON.parse(saved);
+                    } catch(e) {
+                        console.error("解析 LocalStorage 失敗", e);
+                    }
+                }
+                normalizeStateSchema();
+                seedInitialNotificationsIfNeeded();
+                runStateAutomations();
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
                 setBootLoaderPhase("local");
+                return;
+            }
+
+            // 雲端模式不沿用上一位使用者的快取資料，避免跨帳號殘留資訊。
+            state = createUnauthenticatedState();
+            currentUser = null;
+            if (!authSessionToken) {
+                gasConnectionStatus = "remote";
+                setBootLoaderPhase("auth", {
+                    title: "請先登入系統",
+                    message: "登入後才會下載你有權限查看的雲端資料。",
+                    percent: 68,
+                    metricNote: "等待帳號驗證"
+                });
                 return;
             }
 
@@ -2424,27 +2446,9 @@
                 if (!response || !response.data || !response.data.state) {
                     throw new Error("GAS bootstrap response is missing state.");
                 }
-                let remoteState = response.data.state;
-                captureBackendHeatmapData(response.data);
-
-                if (!hasRequiredBootstrapData(remoteState)) {
-                    setBootLoaderPhase("seed");
-                    const seedResponse = await requestGas("saveState", {
-                        state: cloneStateSnapshot(state)
-                    });
-                    remoteState = seedResponse && seedResponse.data && seedResponse.data.state
-                        ? seedResponse.data.state
-                        : cloneStateSnapshot(state);
-                    captureBackendHeatmapData(seedResponse && seedResponse.data ? seedResponse.data : null);
-                    setTimeout(function() {
-                        showToast("GAS 試算表原本是空的，已自動寫入目前前端資料。", "success");
-                    }, 150);
-                }
-
-                applyStateSnapshot(remoteState, { skipRender: true });
-                if (runStateAutomations()) {
-                    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-                    scheduleRemoteStateSync();
+                applyBackendStateResponse(response, { skipRender: true, allowFallback: false });
+                if (!currentUser) {
+                    throw new Error("AUTH_EXPIRED: 無法確認目前登入帳號。");
                 }
                 gasConnectionStatus = "remote";
                 setBootLoaderPhase("remote", {
@@ -2454,14 +2458,23 @@
                     metricNote: "雲端回傳成功"
                 });
             } catch (error) {
-                gasConnectionStatus = "fallback";
+                const message = String(error && error.message || "");
+                const isAuthError = /AUTH_REQUIRED|AUTH_EXPIRED|重新登入/.test(message);
+                gasConnectionStatus = isAuthError ? "remote" : "fallback";
+                if (isAuthError) {
+                    clearStoredSession();
+                    state = createUnauthenticatedState();
+                    currentUser = null;
+                }
                 setBootLoaderPhase("fallback");
-                console.error("GAS 讀取失敗，改用本機資料", error);
+                console.error("GAS 讀取失敗", error);
                 setTimeout(function() {
                     showToast(
-                        isFileProtocolMode()
+                        isAuthError
+                            ? "登入狀態已過期，請重新登入。"
+                            : isFileProtocolMode()
                             ? "目前是直接開啟本機 HTML，請改用 localhost 或靜態網站網址，才能穩定連線 GAS。"
-                            : "GAS 讀取失敗，已改用本機資料。",
+                            : "GAS 讀取失敗，暫時無法載入雲端資料。",
                         "warning"
                     );
                 }, 150);
@@ -2475,7 +2488,7 @@
             heatmapDatasetCache = null;
             renderAll();
 
-            if (options.skipRemoteSync || !isRemoteSyncEnabled()) {
+            if (options.skipRemoteSync || !isRemoteSyncEnabled() || !authSessionToken) {
                 return;
             }
 
@@ -2506,6 +2519,15 @@
 
         function cloneStateSnapshot(snapshot) {
             return JSON.parse(JSON.stringify(snapshot || {}));
+        }
+
+        function createUnauthenticatedState() {
+            const snapshot = cloneStateSnapshot(DEFAULT_STATE);
+            ["Config_Stages", "Users", "Teams", "Purchase_Items", "Assignments", "Assignment_Submissions", "Files", "Notifications", "Discussion_Comments"].forEach(function(key) {
+                snapshot[key] = [];
+            });
+            snapshot.Meta = { State_Revision: 0 };
+            return snapshot;
         }
 
         function isFileProtocolMode() {
@@ -2539,6 +2561,11 @@
 
         function clearStoredSession() {
             localStorage.removeItem(SESSION_STORAGE_KEY);
+            authSessionToken = "";
+            remoteStateRevision = 0;
+            activityLogs = [];
+            activityLogStatus = "idle";
+            activityLogErrorMessage = "";
         }
 
         function persistCurrentSession() {
@@ -2549,7 +2576,8 @@
 
             localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({
                 userId: currentUser.User_ID,
-                workspace: activeWorkspace
+                workspace: activeWorkspace,
+                sessionToken: authSessionToken || ""
             }));
         }
 
@@ -2619,7 +2647,23 @@
             }
 
             captureBackendHeatmapData(responseData);
-            applyStateSnapshot(responseData.state, options);
+            if (Number.isFinite(Number(responseData.stateRevision))) {
+                remoteStateRevision = Number(responseData.stateRevision);
+            }
+            const backendUser = responseData.currentUser && responseData.currentUser.User_ID
+                ? responseData.currentUser
+                : null;
+            applyStateSnapshot(responseData.state, Object.assign({}, options, {
+                preferredUserId: backendUser ? backendUser.User_ID : options.preferredUserId || "",
+                allowFallback: backendUser ? false : options.allowFallback
+            }));
+            if (backendUser) {
+                currentUser = backendUser;
+                activeWorkspace = resolveWorkspaceForUser(currentUser, options.preferredWorkspace || activeWorkspace);
+                if (authSessionToken) {
+                    persistCurrentSession();
+                }
+            }
             return true;
         }
 
@@ -2629,17 +2673,24 @@
                 throw new Error("尚未設定 GAS Web App 網址。");
             }
 
+            const requestPayload = Object.assign({}, payload || {});
+            if (authSessionToken && !requestPayload.sessionToken) {
+                requestPayload.sessionToken = authSessionToken;
+            }
             let response;
 
             if (method === "GET") {
                 const url = new URL(endpoint);
                 url.searchParams.set("action", action);
+                if (requestPayload.sessionToken) {
+                    url.searchParams.set("sessionToken", requestPayload.sessionToken);
+                }
                 response = await fetch(url.toString(), {
                     method: "GET",
                     redirect: "follow"
                 });
             } else {
-                const body = JSON.stringify(Object.assign({ action: action }, payload || {}));
+                const body = JSON.stringify(Object.assign({ action: action }, requestPayload));
                 response = await fetch(endpoint, {
                     method: "POST",
                     headers: {
@@ -2679,7 +2730,7 @@
         }
 
         async function syncStateToBackend() {
-            if (!isRemoteSyncEnabled()) {
+            if (!isRemoteSyncEnabled() || !authSessionToken || !currentUser) {
                 return;
             }
 
@@ -2696,7 +2747,8 @@
 
             try {
                 const response = await requestGas("saveState", {
-                    state: stateSnapshot
+                    state: stateSnapshot,
+                    stateRevision: remoteStateRevision
                 });
                 if (applyBackendStateResponse(response, {
                     preferredUserId: preferredUserId
@@ -2704,9 +2756,34 @@
                     gasConnectionStatus = "remote";
                 }
             } catch (error) {
-                gasConnectionStatus = "fallback";
+                const message = String(error && error.message || "");
+                if (/STATE_CONFLICT/.test(message)) {
+                    try {
+                        const latest = await requestGas("bootstrap", null, "GET");
+                        applyBackendStateResponse(latest, {
+                            preferredUserId: preferredUserId,
+                            allowFallback: false,
+                            skipRender: true
+                        });
+                        gasConnectionStatus = "remote";
+                        showToast("雲端資料剛被其他人更新，已重新載入最新版本；請再操作一次。", "warning");
+                    } catch (reloadError) {
+                        gasConnectionStatus = "fallback";
+                        console.error("衝突後重新載入失敗", reloadError);
+                    }
+                } else if (/AUTH_REQUIRED|AUTH_EXPIRED|重新登入/.test(message)) {
+                    currentUser = null;
+                    activeWorkspace = "admin";
+                    clearStoredSession();
+                    state = createUnauthenticatedState();
+                    gasConnectionStatus = "remote";
+                    renderAll();
+                    showToast("登入狀態已過期，請重新登入。", "warning");
+                } else {
+                    gasConnectionStatus = "fallback";
+                    showToast("GAS 同步失敗，尚未覆蓋雲端資料。", "warning");
+                }
                 console.error("GAS 同步失敗", error);
-                showToast("GAS 同步失敗，資料已暫存於本機。", "warning");
             } finally {
                 remoteSaveInFlight = false;
                 renderConnectionStatusBadge();
@@ -2719,7 +2796,6 @@
 
         async function submitRemoteFileReview(fileId, status, comment) {
             const response = await requestGas("reviewFile", {
-                reviewerUserId: currentUser ? currentUser.User_ID : "",
                 fileId: fileId,
                 status: status,
                 comment: comment || ""
@@ -2736,7 +2812,6 @@
 
         async function submitRemoteNotificationsRead(notificationIds = [], options = {}) {
             const response = await requestGas("markNotificationsRead", {
-                userId: currentUser ? currentUser.User_ID : "",
                 notificationIds: ensureArray(notificationIds),
                 all: options.all === true
             });
@@ -2752,7 +2827,6 @@
 
         async function submitRemoteNotificationsClear(scope, notificationIds = []) {
             const response = await requestGas("clearNotifications", {
-                userId: currentUser ? currentUser.User_ID : "",
                 scope: scope || "selected",
                 notificationIds: ensureArray(notificationIds)
             });
@@ -2770,8 +2844,12 @@
             const response = await requestGas(action, payload);
             const nextState = response && response.data ? response.data.state : null;
             const nextUser = response && response.data ? response.data.currentUser : null;
+            authSessionToken = String(response && response.data && response.data.sessionToken || "");
+            activityLogs = [];
+            activityLogStatus = "idle";
+            activityLogErrorMessage = "";
 
-            if (!nextState || !nextUser || !nextUser.User_ID) {
+            if (!nextState || !nextUser || !nextUser.User_ID || !authSessionToken) {
                 throw new Error("GAS 驗證成功，但回傳資料不完整。");
             }
 
@@ -2786,6 +2864,103 @@
             }
 
             return response;
+        }
+
+        function canViewActivityLogs() {
+            if (!currentUser) return false;
+            return canManageAssignmentBoard(getEffectiveRoleContext().effectiveRole);
+        }
+
+        function getActivityLogRoleLabel(role) {
+            const labels = {
+                SuperAdmin: "形印組長",
+                Admin: "形印組員",
+                Leader: "畢業組長",
+                Member: "畢業組員",
+                System: "系統"
+            };
+            return labels[String(role || "")] || "系統";
+        }
+
+        function getActivityLogTone(log) {
+            const severity = String(log && log.Severity || "normal");
+            if (severity === "warning") {
+                return "bg-[#FFF4E9] text-[#C65A00] border-[#FFE0BE]";
+            }
+            if (severity === "info") {
+                return "bg-[#EEF6FF] text-[#0066CC] border-[#D8E9FF]";
+            }
+            return "bg-[#F3F3F5] text-[#515156] border-[#E8E8ED]";
+        }
+
+        function getFilteredActivityLogs() {
+            return ensureArray(activityLogs).filter(function(log) {
+                if (activityLogFilter === "all") return true;
+                const action = String(log && log.Action || "");
+                const targetType = String(log && log.Target_Type || "");
+                if (activityLogFilter === "submission") {
+                    return ["file", "submission"].includes(targetType) || /繳交|上傳/.test(action);
+                }
+                if (activityLogFilter === "review") {
+                    return /審核|退件/.test(action);
+                }
+                if (activityLogFilter === "account") {
+                    return ["user", "team"].includes(targetType) || /帳號|小組|登入|密碼/.test(action);
+                }
+                if (activityLogFilter === "management") {
+                    return ["stage", "purchase", "assignment"].includes(targetType) || /會審|印刷|繳交項目/.test(action);
+                }
+                return true;
+            });
+        }
+
+        function setActivityLogFilter(nextFilter) {
+            activityLogFilter = nextFilter || "all";
+            renderAll();
+        }
+
+        async function refreshActivityLogs(options = {}) {
+            if (!canViewActivityLogs()) return;
+
+            if (!isRemoteSyncEnabled()) {
+                activityLogStatus = "unavailable";
+                activityLogErrorMessage = "操作紀錄僅在已連線的 GAS 雲端模式中提供。";
+                if (activeTab === "activity") renderAll();
+                return;
+            }
+
+            if (!authSessionToken) {
+                activityLogStatus = "reauth";
+                activityLogErrorMessage = "操作紀錄權限已過期，請重新登入後再查看。";
+                if (activeTab === "activity") renderAll();
+                return;
+            }
+
+            activityLogStatus = "loading";
+            activityLogErrorMessage = "";
+            if (activeTab === "activity") renderAll();
+
+            try {
+                const response = await requestGas("getActivityLogs", {
+                    limit: 160
+                });
+                activityLogs = ensureArray(response && response.data && response.data.logs);
+                activityLogStatus = "ready";
+                gasConnectionStatus = "remote";
+                if (!options.silent) {
+                    showToast("操作紀錄已更新。", "success");
+                }
+            } catch (error) {
+                activityLogStatus = /重新登入|權限/.test(String(error && error.message || "")) ? "reauth" : "error";
+                activityLogErrorMessage = error && error.message ? error.message : "操作紀錄讀取失敗，請稍後再試。";
+            }
+
+            if (activeTab === "activity") renderAll();
+        }
+
+        function restartActivityLogSession() {
+            handleLogout();
+            openAuthView("login");
         }
 
         function ensureArray(value) {
@@ -3248,9 +3423,13 @@
         }
 
         function openLargeUploadWindow(params = {}, sessionMeta = {}) {
+            if (!authSessionToken) {
+                throw new Error("登入狀態已過期，請重新登入後再上傳。");
+            }
             const sessionKey = params.sessionKey || generateLargeUploadSessionKey(params.mode || "large");
             const url = buildLargeUploadPageUrl(Object.assign({}, params, {
-                sessionKey: sessionKey
+                sessionKey: sessionKey,
+                sessionToken: authSessionToken
             }));
 
             largeUploadSessions[sessionKey] = Object.assign({
@@ -3815,8 +3994,72 @@
             return (parts.year || "0000") + "-" + (parts.month || "00") + "-" + (parts.day || "00") + " " + (parts.hour || "00") + ":" + (parts.minute || "00");
         }
 
-        function formatCompactDateTimeLabel(value) {
+        const ENGLISH_SHORT_MONTH_MAP = {
+            Jan: "01",
+            Feb: "02",
+            Mar: "03",
+            Apr: "04",
+            May: "05",
+            Jun: "06",
+            Jul: "07",
+            Aug: "08",
+            Sep: "09",
+            Oct: "10",
+            Nov: "11",
+            Dec: "12"
+        };
+
+        function extractLegacyEnglishDateTimeParts(value) {
             const raw = String(value || "").trim();
+            if (!raw) return null;
+
+            const match = raw.match(/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4})\s+(\d{2}):(\d{2})(?::\d{2})?(?:\s+GMT?\s*[+-]\d{4})?(?:\s+\([^)]+\))?$/);
+            if (!match) return null;
+
+            const monthKey = match[1].slice(0, 1).toUpperCase() + match[1].slice(1, 3).toLowerCase();
+            const month = ENGLISH_SHORT_MONTH_MAP[monthKey];
+            if (!month) return null;
+
+            return {
+                year: match[3],
+                month: month,
+                day: String(match[2]).padStart(2, "0"),
+                hour: match[4],
+                minute: match[5]
+            };
+        }
+
+        function normalizeDateTimeText(value) {
+            const raw = String(value || "").trim();
+            if (!raw) return "";
+
+            const simpleMatch = raw.match(/^(\d{4})[-/](\d{2})[-/](\d{2})(?:[ T](\d{2}):(\d{2}))?/);
+            if (simpleMatch) {
+                const year = simpleMatch[1];
+                const month = simpleMatch[2];
+                const day = simpleMatch[3];
+                const hour = simpleMatch[4];
+                const minute = simpleMatch[5];
+                return hour && minute
+                    ? year + "-" + month + "-" + day + " " + hour + ":" + minute
+                    : year + "-" + month + "-" + day;
+            }
+
+            const legacyParts = extractLegacyEnglishDateTimeParts(raw);
+            if (legacyParts) {
+                return legacyParts.year + "-" + legacyParts.month + "-" + legacyParts.day + " " + legacyParts.hour + ":" + legacyParts.minute;
+            }
+
+            const parsed = new Date(raw);
+            if (Number.isFinite(parsed.getTime())) {
+                return formatDateTimeTaipei(parsed);
+            }
+
+            return raw.replace("T", " ");
+        }
+
+        function formatCompactDateTimeLabel(value) {
+            const raw = normalizeDateTimeText(value);
             if (!raw) return "";
 
             const simpleMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?/);
@@ -3832,7 +4075,7 @@
                 return year + "/" + month + "/" + day;
             }
 
-            const parsed = new Date(raw);
+            const parsed = new Date(String(value || "").trim());
             if (Number.isFinite(parsed.getTime())) {
                 const formatter = new Intl.DateTimeFormat("zh-Hant-TW", {
                     timeZone: "Asia/Taipei",
@@ -4223,7 +4466,7 @@
         }
 
         function normalizeAssignmentDateTime(value) {
-            return String(value || "").trim().replace("T", " ");
+            return normalizeDateTimeText(value);
         }
 
         function formatAssignmentDateTimeInput(value) {
@@ -4443,13 +4686,17 @@
         }
 
         function isAssignmentOverdue(assignment) {
-            const dueAt = String(assignment && assignment.Due_At || "").trim();
+            const dueMs = parseAssignmentDateTimeMs(assignment && assignment.Due_At);
+            if (Number.isFinite(dueMs)) {
+                return dueMs < Date.now();
+            }
+            const dueAt = normalizeAssignmentDateTime(assignment && assignment.Due_At);
             if (!dueAt) return false;
             return dueAt < formatDateTimeTaipei(new Date());
         }
 
         function parseAssignmentDateTimeMs(value) {
-            const raw = String(value || "").trim();
+            const raw = normalizeAssignmentDateTime(value);
             if (!raw) return NaN;
             const normalized = raw.indexOf("T") >= 0 ? raw : raw.replace(" ", "T");
             const parsed = new Date(normalized);
@@ -7164,9 +7411,16 @@
             });
         }
 
-        function handleLogout() {
+        async function handleLogout() {
             setLoginSubmitting(false);
             closeTopbarMenu();
+            if (isRemoteSyncEnabled() && authSessionToken) {
+                try {
+                    await requestGas("logout", {});
+                } catch (error) {
+                    console.warn("雲端登出狀態回收失敗", error);
+                }
+            }
             currentUser = null;
             activeWorkspace = "admin";
             clearStoredSession();
@@ -7311,8 +7565,8 @@
                 return;
             }
 
-            if (nextPassword.length < 3) {
-                showToast("密碼至少需要 3 碼。", "warning");
+            if (nextPassword.length < 8) {
+                showToast("密碼至少需要 8 碼。", "warning");
                 return;
             }
 
@@ -7538,10 +7792,70 @@
             saveState();
         }
 
-        function deletePurchaseItem(itemId) {
-            state.Purchase_Items = state.Purchase_Items.filter(function(p) { return p.Item_ID !== itemId; });
-            showToast("品項已成功移出發包清單", "info");
-            saveState();
+        function setPurchaseDeleteButtonPending(itemId, isPending) {
+            const button = Array.from(document.querySelectorAll('[data-purchase-delete-id]')).find(function(element) {
+                return element.dataset.purchaseDeleteId === itemId;
+            });
+
+            if (!button) return;
+
+            button.disabled = isPending;
+            button.classList.toggle('opacity-50', isPending);
+            button.classList.toggle('cursor-wait', isPending);
+            button.setAttribute('aria-busy', isPending ? 'true' : 'false');
+            const label = button.querySelector('span');
+            if (label) {
+                label.textContent = isPending ? '處理中' : '刪除';
+            }
+        }
+
+        async function deletePurchaseItem(itemId) {
+            const normalizedItemId = String(itemId || '').trim();
+            const targetItem = state.Purchase_Items.find(function(item) {
+                return item.Item_ID === normalizedItemId;
+            });
+
+            if (!targetItem || pendingPurchaseDeletionIds.has(normalizedItemId)) {
+                return;
+            }
+
+            if (!isRemoteSyncEnabled() || !authSessionToken) {
+                state.Purchase_Items = state.Purchase_Items.filter(function(item) {
+                    return item.Item_ID !== normalizedItemId;
+                });
+                showToast('品項已成功移出發包清單', 'info');
+                saveState();
+                return;
+            }
+
+            pendingPurchaseDeletionIds.add(normalizedItemId);
+            setPurchaseDeleteButtonPending(normalizedItemId, true);
+
+            try {
+                const response = await requestGas('deletePurchaseItem', {
+                    itemId: normalizedItemId
+                });
+                const applied = applyBackendStateResponse(response, {
+                    preferredUserId: currentUser && currentUser.User_ID ? currentUser.User_ID : '',
+                    allowFallback: false
+                });
+
+                if (!applied) {
+                    throw new Error('GAS 未回傳最新資料，請重新整理後再試。');
+                }
+
+                gasConnectionStatus = 'remote';
+                showToast('品項已成功移出發包清單', 'success');
+            } catch (error) {
+                const message = String(error && error.message || '刪除失敗，請稍後再試。');
+                gasConnectionStatus = 'fallback';
+                showToast('無法刪除品項：' + message, 'error');
+                console.error('刪除發包品項失敗', error);
+                setPurchaseDeleteButtonPending(normalizedItemId, false);
+            } finally {
+                pendingPurchaseDeletionIds.delete(normalizedItemId);
+                renderConnectionStatusBadge();
+            }
         }
 
         function handleCreateStage(e) {
@@ -8219,6 +8533,9 @@
             }
             activeTab = tabId;
             renderAll();
+            if (tabId === "activity") {
+                refreshActivityLogs({ silent: true });
+            }
         }
 
         // 變更熱量圖過濾視角
@@ -8226,14 +8543,14 @@
             activeHeatmapFilter = filter;
             refreshHeatmapFilterButtons();
             renderHeatmap();
-            showToast("熱量圖已切換至【" + (filter === 'daily' ? '每日活躍' : filter === 'weekly' ? '每週趨勢' : '累計動態') + "】", "info");
+            showToast("熱量圖已切換至【" + (filter === 'daily' ? '本週每日' : filter === 'weekly' ? '本月每週' : '本年每月') + "】", "info");
         }
 
         function refreshHeatmapFilterButtons() {
             const buttonConfig = {
                 daily: document.getElementById('btn-heat-daily'),
                 weekly: document.getElementById('btn-heat-weekly'),
-                total: document.getElementById('btn-heat-total')
+                monthly: document.getElementById('btn-heat-monthly')
             };
 
             Object.keys(buttonConfig).forEach(function(key) {
@@ -8301,6 +8618,50 @@
             return match ? match[1] : "";
         }
 
+        function getHeatmapDateTimeParts(value) {
+            const normalized = normalizeDateTimeText(value);
+            if (!normalized) {
+                return {
+                    dateKey: "",
+                    hour: null,
+                    minute: null
+                };
+            }
+
+            const match = normalized.match(/^(\d{4}-\d{2}-\d{2})(?:\s+(\d{2})(?::(\d{2}))?)?/);
+            if (!match) {
+                return {
+                    dateKey: "",
+                    hour: null,
+                    minute: null
+                };
+            }
+
+            return {
+                dateKey: match[1],
+                hour: typeof match[2] === "string" ? Math.max(0, Math.min(23, Number(match[2]))) : null,
+                minute: typeof match[3] === "string" ? Math.max(0, Math.min(59, Number(match[3]))) : null
+            };
+        }
+
+        function getHeatmapHourKey(hour) {
+            return String(Math.max(0, Math.min(23, Number(hour) || 0))).padStart(2, "0");
+        }
+
+        function getHeatmapHourRangeLabel(hour) {
+            const normalizedHour = Math.max(0, Math.min(23, Number(hour) || 0));
+            const nextHour = (normalizedHour + 1) % 24;
+            return getHeatmapHourKey(normalizedHour) + ":00 - " + getHeatmapHourKey(nextHour) + ":00";
+        }
+
+        function getHeatmapDayPeriodLabel(hour) {
+            const normalizedHour = Math.max(0, Math.min(23, Number(hour) || 0));
+            if (normalizedHour < 6) return "凌晨";
+            if (normalizedHour < 12) return "早上";
+            if (normalizedHour < 18) return "下午";
+            return "晚上";
+        }
+
         function formatHeatmapDisplayDate(dateKey) {
             const match = String(dateKey || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
             if (!match) return String(dateKey || "");
@@ -8312,8 +8673,8 @@
         }
 
         function buildHeatmapDatasetFromState(sourceState) {
-            const range = getHeatmapDateRange();
             const buckets = {};
+            const hourlyBuckets = {};
             const summary = {
                 files: 0,
                 purchases: 0,
@@ -8324,50 +8685,64 @@
                 peakValue: 0
             };
 
-            ensureArray(sourceState && sourceState.Files).forEach(function(file) {
-                const dateKey = getHeatmapDateKey(file && file.Upload_Time);
-                if (!dateKey || dateKey < range.startKey || dateKey > range.endKey) return;
+            function ensureBucket(dateKey) {
                 if (!buckets[dateKey]) {
                     buckets[dateKey] = { date: dateKey, files: 0, purchases: 0, assignments: 0, total: 0 };
                 }
-                buckets[dateKey].files += 1;
+                return buckets[dateKey];
+            }
+
+            function ensureHourlyBucket(dateKey, hour) {
+                const hourKey = dateKey + " " + getHeatmapHourKey(hour);
+                if (!hourlyBuckets[hourKey]) {
+                    hourlyBuckets[hourKey] = {
+                        date: dateKey,
+                        hour: Math.max(0, Math.min(23, Number(hour) || 0)),
+                        files: 0,
+                        purchases: 0,
+                        assignments: 0,
+                        total: 0
+                    };
+                }
+                return hourlyBuckets[hourKey];
+            }
+
+            function registerHeatmapActivity(value, bucketField) {
+                const parts = getHeatmapDateTimeParts(value);
+                if (!parts.dateKey) return;
+
+                ensureBucket(parts.dateKey)[bucketField] += 1;
+                ensureHourlyBucket(parts.dateKey, parts.hour == null ? 12 : parts.hour)[bucketField] += 1;
+            }
+
+            ensureArray(sourceState && sourceState.Files).forEach(function(file) {
+                registerHeatmapActivity(file && file.Upload_Time, "files");
                 summary.files += 1;
             });
 
             ensureArray(sourceState && sourceState.Purchase_Items).forEach(function(item) {
-                const dateKey = getHeatmapDateKey(item && item.Created_At);
-                if (!dateKey || dateKey < range.startKey || dateKey > range.endKey) return;
-                if (!buckets[dateKey]) {
-                    buckets[dateKey] = { date: dateKey, files: 0, purchases: 0, assignments: 0, total: 0 };
-                }
-                buckets[dateKey].purchases += 1;
+                registerHeatmapActivity(item && item.Created_At, "purchases");
                 summary.purchases += 1;
             });
 
             ensureArray(sourceState && sourceState.Assignment_Submissions).forEach(function(submission) {
-                const dateKey = getHeatmapDateKey(submission && (submission.Submitted_At || submission.Updated_At));
-                if (!dateKey || dateKey < range.startKey || dateKey > range.endKey) return;
-                if (!buckets[dateKey]) {
-                    buckets[dateKey] = { date: dateKey, files: 0, purchases: 0, assignments: 0, total: 0 };
-                }
-                buckets[dateKey].assignments += 1;
+                registerHeatmapActivity(submission && (submission.Submitted_At || submission.Updated_At), "assignments");
                 summary.assignments += 1;
             });
 
-            const timeline = [];
-            let cursor = new Date(range.startDate.getTime());
-            while (cursor.getTime() <= range.endDate.getTime()) {
-                const dateKey = formatHeatmapDateKey(cursor);
+            const timeline = Object.keys(buckets).sort().map(function(dateKey) {
                 const bucket = buckets[dateKey] || { date: dateKey, files: 0, purchases: 0, assignments: 0, total: 0 };
                 bucket.total = Number(bucket.files || 0) + Number(bucket.purchases || 0) + Number(bucket.assignments || 0);
-                timeline.push({
+                return {
                     date: bucket.date,
                     files: bucket.files,
                     purchases: bucket.purchases,
                     assignments: bucket.assignments,
                     total: bucket.total
-                });
+                };
+            });
 
+            timeline.forEach(function(bucket) {
                 if (bucket.total > 0) {
                     summary.activeDays += 1;
                 }
@@ -8375,75 +8750,211 @@
                     summary.peakValue = bucket.total;
                     summary.peakDate = bucket.date;
                 }
+            });
 
-                cursor.setUTCDate(cursor.getUTCDate() + 1);
-            }
+            Object.keys(hourlyBuckets).forEach(function(hourKey) {
+                const bucket = hourlyBuckets[hourKey];
+                bucket.total = Number(bucket.files || 0) + Number(bucket.purchases || 0) + Number(bucket.assignments || 0);
+            });
 
             summary.total = summary.files + summary.purchases + summary.assignments;
 
             return {
-                range: {
-                    startDate: range.startKey,
-                    endDate: range.endKey,
-                    academicYearLabel: range.academicYearLabel
-                },
+                range: null,
                 timeline: timeline,
+                hourlyBuckets: hourlyBuckets,
                 summary: summary
             };
         }
 
-        function buildHeatmapViewSeries(timeline, viewMode) {
-            const series = [];
-            const rollingWindow = [];
-            let rollingSum = 0;
-            let cumulativeSum = 0;
+        function buildHeatmapViewModel(heatmapDataset, viewMode) {
+            const timeline = ensureArray(heatmapDataset && heatmapDataset.timeline);
+            const timelineMap = {};
+            const weekdayAxisLabels = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"];
+            const todayKey = formatHeatmapDateKey(new Date());
+            const todayDate = buildDateFromHeatmapDateKey(todayKey);
+            const currentYear = todayDate.getUTCFullYear();
+            const currentMonthIndex = todayDate.getUTCMonth();
+            const hourlyBuckets = heatmapDataset && heatmapDataset.hourlyBuckets ? heatmapDataset.hourlyBuckets : {};
+
+            function createBucket() {
+                return {
+                    files: 0,
+                    purchases: 0,
+                    assignments: 0,
+                    total: 0
+                };
+            }
+
+            function mergeBucket(target, source) {
+                target.files += Number(source && source.files ? source.files : 0);
+                target.purchases += Number(source && source.purchases ? source.purchases : 0);
+                target.assignments += Number(source && source.assignments ? source.assignments : 0);
+                target.total += Number(source && source.total ? source.total : 0);
+                return target;
+            }
+
+            function buildBucketTitle(label, bucket) {
+                const total = Number(bucket && bucket.total ? bucket.total : 0);
+                const assignments = Number(bucket && bucket.assignments ? bucket.assignments : 0);
+                const files = Number(bucket && bucket.files ? bucket.files : 0);
+                const purchases = Number(bucket && bucket.purchases ? bucket.purchases : 0);
+                return label + " • " + (total === 0
+                    ? "無活動"
+                    : total + " 筆動態（作業 " + assignments + " / 檔案 " + files + " / 採購 " + purchases + "）");
+            }
 
             ensureArray(timeline).forEach(function(day) {
-                const filesCount = Number(day && day.files ? day.files : 0);
-                const purchaseCount = Number(day && day.purchases ? day.purchases : 0);
-                const assignmentCount = Number(day && day.assignments ? day.assignments : 0);
-                const dailyTotal = Number(day && day.total ? day.total : filesCount + purchaseCount + assignmentCount);
-                let viewValue = dailyTotal;
-
-                if (viewMode === "weekly") {
-                    rollingWindow.push(dailyTotal);
-                    rollingSum += dailyTotal;
-                    if (rollingWindow.length > 7) {
-                        rollingSum -= rollingWindow.shift();
-                    }
-                    viewValue = rollingSum;
-                } else if (viewMode === "total") {
-                    cumulativeSum += dailyTotal;
-                    viewValue = cumulativeSum;
-                }
-
-                const dateLabel = formatHeatmapDisplayDate(day && day.date);
-                let title = dateLabel + " • ";
-                if (viewMode === "daily") {
-                    title += dailyTotal === 0
-                        ? "無活動"
-                        : dailyTotal + " 筆動態（作業 " + assignmentCount + " / 檔案 " + filesCount + " / 採購 " + purchaseCount + "）";
-                } else if (viewMode === "weekly") {
-                    title += viewValue + " 筆近七日動態（今日作業 " + assignmentCount + " / 今日檔案 " + filesCount + " / 今日採購 " + purchaseCount + "）";
-                } else {
-                    title += viewValue + " 筆累計動態（截至今日）";
-                }
-
-                series.push({
-                    date: day && day.date ? day.date : "",
-                    files: filesCount,
-                    purchases: purchaseCount,
-                    assignments: assignmentCount,
-                    dailyTotal: dailyTotal,
-                    value: viewValue,
-                    title: title
-                });
+                const dateKey = String(day && day.date ? day.date : "").trim();
+                if (!dateKey) return;
+                timelineMap[dateKey] = {
+                    files: Number(day && day.files ? day.files : 0),
+                    purchases: Number(day && day.purchases ? day.purchases : 0),
+                    assignments: Number(day && day.assignments ? day.assignments : 0),
+                    total: Number(day && day.total ? day.total : 0)
+                };
             });
 
-            return series;
+            if (viewMode === "daily") {
+                const mondayOffset = (todayDate.getUTCDay() + 6) % 7;
+                const weekStartDate = new Date(todayDate.getTime());
+                weekStartDate.setUTCDate(todayDate.getUTCDate() - mondayOffset);
+                const xLabels = [];
+                const yLabels = [];
+                const cells = [];
+
+                for (let hour = 0; hour < 24; hour += 1) {
+                    xLabels.push({
+                        label: hour % 6 === 0 ? getHeatmapHourKey(hour) : "",
+                        sublabel: ""
+                    });
+                }
+
+                weekdayAxisLabels.forEach(function(weekdayLabel, index) {
+                    const cellDate = new Date(weekStartDate.getTime());
+                    cellDate.setUTCDate(weekStartDate.getUTCDate() + index);
+                    const dateKey = formatHeatmapDateKey(cellDate);
+                    const monthLabel = cellDate.getUTCMonth() + 1;
+                    const dayLabel = cellDate.getUTCDate();
+                    yLabels.push({
+                        label: weekdayLabel,
+                        sublabel: monthLabel + "/" + dayLabel
+                    });
+
+                    for (let hour = 0; hour < 24; hour += 1) {
+                        const hourKey = dateKey + " " + getHeatmapHourKey(hour);
+                        const bucket = hourlyBuckets[hourKey] || createBucket();
+                        cells.push({
+                            key: hourKey,
+                            files: bucket.files,
+                            purchases: bucket.purchases,
+                            assignments: bucket.assignments,
+                            value: bucket.total,
+                            title: buildBucketTitle(
+                                formatHeatmapDisplayDate(dateKey) + " " + getHeatmapHourRangeLabel(hour) + "（" + weekdayLabel + "・" + getHeatmapDayPeriodLabel(hour) + "）",
+                                bucket
+                            )
+                        });
+                    }
+                });
+
+                return {
+                    note: "本週 7 天 × 24 小時活動熱圖",
+                    compact: true,
+                    columns: 24,
+                    rows: 7,
+                    minWidthPx: 0,
+                    xLabels: xLabels,
+                    yLabels: yLabels,
+                    cells: cells
+                };
+            }
+
+            if (viewMode === "weekly") {
+                const lastDateOfMonth = new Date(Date.UTC(currentYear, currentMonthIndex + 1, 0));
+                const lastDay = lastDateOfMonth.getUTCDate();
+                const series = [];
+
+                for (let startDay = 1, weekIndex = 1; startDay <= lastDay; startDay += 7, weekIndex += 1) {
+                    const endDay = Math.min(lastDay, startDay + 6);
+                    const bucket = createBucket();
+
+                    for (let dayOfMonth = startDay; dayOfMonth <= endDay; dayOfMonth += 1) {
+                        const dateKey = formatHeatmapDateKey(new Date(Date.UTC(currentYear, currentMonthIndex, dayOfMonth)));
+                        mergeBucket(bucket, timelineMap[dateKey] || createBucket());
+                    }
+
+                    const rangeLabel = (currentMonthIndex + 1) + "/" + startDay + "-" + (currentMonthIndex + 1) + "/" + endDay;
+                    series.push({
+                        key: currentYear + "-" + String(currentMonthIndex + 1).padStart(2, "0") + "-W" + weekIndex,
+                        label: "第" + weekIndex + "週",
+                        sublabel: rangeLabel,
+                        files: bucket.files,
+                        purchases: bucket.purchases,
+                        assignments: bucket.assignments,
+                        value: bucket.total,
+                        title: buildBucketTitle(currentYear + "年" + (currentMonthIndex + 1) + "月第" + weekIndex + "週（" + rangeLabel + "）", bucket)
+                    });
+                }
+
+                return {
+                    note: currentYear + " 年 " + (currentMonthIndex + 1) + " 月每週活動數據",
+                    compact: false,
+                    columns: Math.max(1, series.length),
+                    rows: 1,
+                    minWidthPx: 0,
+                    xLabels: series.map(function(item) {
+                        return {
+                            label: item.label,
+                            sublabel: item.sublabel
+                        };
+                    }),
+                    yLabels: [],
+                    cells: series
+                };
+            }
+
+            const monthlySeries = [];
+            for (let monthIndex = 0; monthIndex < 12; monthIndex += 1) {
+                const lastDateOfMonth = new Date(Date.UTC(currentYear, monthIndex + 1, 0));
+                const lastDay = lastDateOfMonth.getUTCDate();
+                const bucket = createBucket();
+
+                for (let dayOfMonth = 1; dayOfMonth <= lastDay; dayOfMonth += 1) {
+                    const dateKey = formatHeatmapDateKey(new Date(Date.UTC(currentYear, monthIndex, dayOfMonth)));
+                    mergeBucket(bucket, timelineMap[dateKey] || createBucket());
+                }
+
+                monthlySeries.push({
+                    key: currentYear + "-" + String(monthIndex + 1).padStart(2, "0"),
+                    label: (monthIndex + 1) + "月",
+                    sublabel: "",
+                    files: bucket.files,
+                    purchases: bucket.purchases,
+                    assignments: bucket.assignments,
+                    value: bucket.total,
+                    title: buildBucketTitle(currentYear + "年" + (monthIndex + 1) + "月", bucket)
+                });
+            }
+
+            return {
+                note: currentYear + " 年 12 個月份的活動數據",
+                compact: false,
+                columns: 12,
+                rows: 1,
+                minWidthPx: 0,
+                xLabels: monthlySeries.map(function(item) {
+                    return {
+                        label: item.label,
+                        sublabel: ""
+                    };
+                }),
+                yLabels: [],
+                cells: monthlySeries
+            };
         }
 
-        function getHeatmapCellClass(level) {
+        function getHeatmapCellClass(level, compactMode) {
             const palette = {
                 0: "bg-[#E8E8ED]",
                 1: "bg-[#D1E4FF]",
@@ -8451,32 +8962,103 @@
                 3: "bg-[#5499FF]",
                 4: "bg-[#0066CC]"
             };
-            return (palette[level] || palette[0]) + " rounded-[3px] cursor-pointer transition-all duration-150 hover:ring-1 hover:ring-[#0066CC] hover:scale-125 relative group";
+            const shape = compactMode
+                ? "rounded-[5px] hover:scale-[1.08]"
+                : "rounded-2xl hover:scale-[1.02]";
+            return (palette[level] || palette[0]) + " " + shape + " cursor-pointer transition-all duration-150 hover:ring-1 hover:ring-[#0066CC] relative group";
         }
 
         // 動態生成與渲染 Apple Minimalist Token 活動熱量圖
         function renderHeatmap() {
             const grid = document.getElementById('heatmap-grid');
+            const heatmapLayout = document.getElementById('heatmap-layout');
+            const heatmapBoard = document.getElementById('heatmap-board');
+            const xAxis = document.getElementById('heatmap-x-axis');
+            const yAxis = document.getElementById('heatmap-y-axis');
+            const note = document.getElementById('heatmap-range-note');
             if (!grid) return;
             
             grid.innerHTML = '';
-            grid.style.gridAutoColumns = "minmax(0, 1fr)";
+            if (xAxis) xAxis.innerHTML = '';
+            if (yAxis) yAxis.innerHTML = '';
             const heatmapDataset = getHeatmapDataset();
-            const viewSeries = buildHeatmapViewSeries(ensureArray(heatmapDataset && heatmapDataset.timeline), activeHeatmapFilter);
-            const maxValue = viewSeries.reduce(function(max, item) {
+            const viewModel = buildHeatmapViewModel(heatmapDataset, activeHeatmapFilter);
+            const cells = ensureArray(viewModel && viewModel.cells);
+            const maxValue = cells.reduce(function(max, item) {
                 return Math.max(max, Number(item.value || 0));
             }, 0);
+            const columnCount = Math.max(1, Number(viewModel && viewModel.columns ? viewModel.columns : 1));
+            const rowCount = Math.max(1, Number(viewModel && viewModel.rows ? viewModel.rows : 1));
+            const compactMode = Boolean(viewModel && viewModel.compact);
 
-            viewSeries.forEach(function(item) {
+            if (heatmapLayout) {
+                heatmapLayout.style.minWidth = "0px";
+                heatmapLayout.style.width = "100%";
+            }
+
+            if (heatmapBoard) {
+                heatmapBoard.style.gridTemplateColumns = compactMode ? "74px minmax(0, 1fr)" : "minmax(0, 1fr)";
+            }
+
+            grid.style.gridTemplateColumns = "repeat(" + columnCount + ", minmax(0, 1fr))";
+            grid.style.gridTemplateRows = compactMode
+                ? "repeat(" + rowCount + ", minmax(14px, 1fr))"
+                : "repeat(" + rowCount + ", minmax(44px, 1fr))";
+            grid.style.gridAutoColumns = "";
+            grid.style.gap = compactMode ? "3px" : "10px";
+            grid.style.height = compactMode ? String((rowCount * 14) + ((rowCount - 1) * 3)) + "px" : "44px";
+            grid.style.minHeight = grid.style.height;
+
+            if (xAxis) {
+                xAxis.style.gridTemplateColumns = "repeat(" + columnCount + ", minmax(0, 1fr))";
+                xAxis.style.gap = compactMode ? "3px" : "10px";
+            }
+
+            if (yAxis) {
+                yAxis.style.display = compactMode ? "grid" : "none";
+                yAxis.style.gridTemplateRows = "repeat(" + rowCount + ", minmax(14px, 1fr))";
+                yAxis.style.gap = compactMode ? "3px" : "10px";
+            }
+
+            if (note) {
+                note.textContent = String(viewModel && viewModel.note ? viewModel.note : "");
+            }
+
+            ensureArray(viewModel && viewModel.yLabels).forEach(function(item) {
+                if (!yAxis) return;
+                const axisLabel = document.createElement('div');
+                if (compactMode) {
+                    axisLabel.className = "flex items-center justify-end gap-1.5 pr-1.5 text-right whitespace-nowrap";
+                    axisLabel.innerHTML = '<span class="text-[10px] font-semibold text-[#86868B] leading-none">' + (item.label || "") + '</span>'
+                        + ((item.sublabel || "") ? '<span class="text-[9px] text-[#AEAEB2] leading-none">' + item.sublabel + '</span>' : '');
+                } else {
+                    axisLabel.className = "flex flex-col justify-center pr-1.5 text-right";
+                    axisLabel.innerHTML = '<div class="text-[10px] font-semibold text-[#86868B] leading-none">' + (item.label || "") + '</div>'
+                        + ((item.sublabel || "") ? '<div class="text-[9px] text-[#AEAEB2] mt-0.5 leading-none">' + item.sublabel + '</div>' : '');
+                }
+                yAxis.appendChild(axisLabel);
+            });
+
+            ensureArray(viewModel && viewModel.xLabels).forEach(function(item) {
+                if (!xAxis) return;
+                const axisLabel = document.createElement('div');
+                axisLabel.className = "min-w-0 text-center";
+                axisLabel.innerHTML = '<div class="' + (compactMode ? 'text-[10px]' : 'text-[10px]') + ' font-semibold tracking-[0.02em] text-[#86868B] leading-none">' + (item.label || "&nbsp;") + '</div>'
+                    + ((item.sublabel || "") ? '<div class="' + (compactMode ? 'text-[8px]' : 'text-[9px]') + ' text-[#AEAEB2] mt-0.5 leading-none">' + item.sublabel + '</div>' : '');
+                xAxis.appendChild(axisLabel);
+            });
+
+            cells.forEach(function(item) {
                 const cell = document.createElement('div');
                 const value = Number(item.value || 0);
                 let activityLevel = 0;
                 if (value > 0 && maxValue > 0) {
                     activityLevel = Math.max(1, Math.min(4, Math.ceil((value / maxValue) * 4)));
                 }
-                cell.className = getHeatmapCellClass(activityLevel);
+                cell.className = getHeatmapCellClass(activityLevel, compactMode);
                 cell.title = item.title;
                 cell.setAttribute("aria-label", item.title);
+                cell.style.minHeight = compactMode ? "14px" : "44px";
                 grid.appendChild(cell);
             });
 
@@ -8742,36 +9324,28 @@
 
                     <!-- Token 活動熱量圖 (形印籌備組專用亮點) -->
                     ${isExhibitionAdmin ? `
-                    <div class="bg-white border border-[#E8E8ED] rounded-3xl p-6 shadow-sm" data-notification-entrance="shell">
-                        <div class="flex items-center justify-between mb-4">
+                    <div class="bg-white border border-[#E8E8ED] rounded-3xl p-5 md:p-6 shadow-sm" data-notification-entrance="shell">
+                        <div class="flex items-start justify-between gap-4 mb-3">
                             <div>
                                 <h3 class="font-bold text-base text-[#1D1D1F]">Token 活動</h3>
-                                <p class="text-xs text-[#86868B] mt-0.5">依作業繳交與大宗採購的每日活躍度矩陣</p>
+                                <p id="heatmap-range-note" class="text-xs text-[#86868B] mt-0.5">本週 7 天 × 24 小時活動熱圖</p>
                             </div>
                             <div class="relative grid grid-cols-3 gap-1 p-1 bg-[#F5F5F7] rounded-full border border-[#E8E8ED] overflow-hidden min-w-[204px]" data-pill-group="heatmapView">
                                 <span data-pill-indicator="heatmapView" class="pointer-events-none absolute inset-y-1 left-0 rounded-full bg-[#0066CC] shadow-[0_6px_18px_rgba(0,102,204,0.22)]"></span>
                                 <button type="button" onclick="changeHeatmapFilter('daily')" id="btn-heat-daily" data-pill-button="heatmapView" data-pill-value="daily" data-active="${activeHeatmapFilter === 'daily'}" class="relative z-10 px-3 py-1.5 rounded-full text-[10px] font-bold transition-colors duration-200 ${activeHeatmapFilter === 'daily' ? 'text-white' : 'text-[#86868B] hover:text-[#1D1D1F]'}">每日</button>
                                 <button type="button" onclick="changeHeatmapFilter('weekly')" id="btn-heat-weekly" data-pill-button="heatmapView" data-pill-value="weekly" data-active="${activeHeatmapFilter === 'weekly'}" class="relative z-10 px-3 py-1.5 rounded-full text-[10px] font-semibold transition-colors duration-200 ${activeHeatmapFilter === 'weekly' ? 'text-white' : 'text-[#86868B] hover:text-[#1D1D1F]'}">每週</button>
-                                <button type="button" onclick="changeHeatmapFilter('total')" id="btn-heat-total" data-pill-button="heatmapView" data-pill-value="total" data-active="${activeHeatmapFilter === 'total'}" class="relative z-10 px-3 py-1.5 rounded-full text-[10px] font-semibold transition-colors duration-200 ${activeHeatmapFilter === 'total' ? 'text-white' : 'text-[#86868B] hover:text-[#1D1D1F]'}">累計</button>
+                                <button type="button" onclick="changeHeatmapFilter('monthly')" id="btn-heat-monthly" data-pill-button="heatmapView" data-pill-value="monthly" data-active="${activeHeatmapFilter === 'monthly'}" class="relative z-10 px-3 py-1.5 rounded-full text-[10px] font-semibold transition-colors duration-200 ${activeHeatmapFilter === 'monthly' ? 'text-white' : 'text-[#86868B] hover:text-[#1D1D1F]'}">每月</button>
                             </div>
                         </div>
                         
-                        <div class="overflow-x-auto py-1">
-                            <div class="min-w-[850px] pr-2">
-                                <div id="heatmap-grid" class="grid grid-flow-col grid-rows-7 gap-[3.5px] h-[105px] w-full mb-3"></div>
-                                <div class="grid grid-cols-12 text-[10px] text-[#86868B] font-semibold px-0.5 select-none text-left">
-                                    <div>8月</div>
-                                    <div>9月</div>
-                                    <div>10月</div>
-                                    <div>11月</div>
-                                    <div>12月</div>
-                                    <div>1月</div>
-                                    <div>2月</div>
-                                    <div>3月</div>
-                                    <div>4月</div>
-                                    <div>5月</div>
-                                    <div>6月</div>
-                                    <div>7月</div>
+                        <div class="pt-1 overflow-hidden">
+                            <div id="heatmap-layout" class="w-full min-w-0 pr-0">
+                                <div id="heatmap-board" class="grid grid-cols-1 gap-x-3 items-start">
+                                    <div id="heatmap-y-axis" class="hidden"></div>
+                                    <div class="min-w-0">
+                                        <div id="heatmap-x-axis" class="grid gap-[10px] px-0.5 select-none mb-1.5"></div>
+                                        <div id="heatmap-grid" class="grid gap-[10px] h-[44px] w-full"></div>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -9332,8 +9906,8 @@
                                                     <td class="py-3.5 px-4 text-center text-[#86868B] font-mono">${item.Quantity}</td>
                                                     <td class="py-3.5 px-4 text-right font-bold text-[#0066CC] font-mono">NT$ ${item.Subtotal.toLocaleString()}</td>
                                                     <td class="py-3.5 px-4 text-right">
-                                                        <button onclick="deletePurchaseItem('${item.Item_ID}')" class="text-xs text-[#FF3B30] font-bold hover:underline flex items-center gap-1 justify-end ml-auto">
-                                                            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i> 刪除
+                                                        <button data-purchase-delete-id="${item.Item_ID}" onclick="deletePurchaseItem('${item.Item_ID}')" class="text-xs text-[#FF3B30] font-bold hover:underline flex items-center gap-1 justify-end ml-auto disabled:pointer-events-none">
+                                                            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i><span>刪除</span>
                                                         </button>
                                                     </td>
                                                 ` : ''}
@@ -9346,6 +9920,110 @@
                     </div>
                 `;
             } 
+            else if (activeTab === "activity" && isExhibitionAdmin) {
+                const visibleLogs = getFilteredActivityLogs();
+                const filters = [
+                    { id: "all", label: "全部" },
+                    { id: "management", label: "管理異動" },
+                    { id: "submission", label: "繳交" },
+                    { id: "review", label: "審核" },
+                    { id: "account", label: "帳號" }
+                ];
+                const filterMarkup = filters.map(function(filter) {
+                    const isActive = activityLogFilter === filter.id;
+                    return `<button type="button" onclick="setActivityLogFilter('${filter.id}')" class="rounded-full px-3 py-1.5 text-[11px] font-semibold transition ${isActive ? 'bg-[#1D1D1F] text-white shadow-sm' : 'text-[#6E6E73] hover:bg-white hover:text-[#1D1D1F]'}">${filter.label}</button>`;
+                }).join('');
+
+                let activityBodyMarkup = '';
+                if (activityLogStatus === "loading") {
+                    activityBodyMarkup = `
+                        <div class="space-y-2.5 animate-pulse">
+                            ${Array.from({ length: 5 }).map(function() {
+                                return '<div class="h-[68px] rounded-2xl bg-[#F5F5F7]"></div>';
+                            }).join('')}
+                        </div>
+                    `;
+                } else if (["reauth", "unavailable", "error"].includes(activityLogStatus)) {
+                    const needsLogin = activityLogStatus === "reauth";
+                    activityBodyMarkup = `
+                        <div class="rounded-[24px] border border-[#E8E8ED] bg-[#FAFAFB] px-5 py-10 text-center">
+                            <div class="mx-auto inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-[#E4E4E8] bg-white text-[#6E6E73]">
+                                <i data-lucide="${needsLogin ? 'shield-alert' : 'cloud-off'}" class="h-5 w-5"></i>
+                            </div>
+                            <h4 class="mt-3 text-sm font-bold text-[#1D1D1F]">${needsLogin ? '需要重新驗證' : '暫時無法載入操作紀錄'}</h4>
+                            <p class="mx-auto mt-1.5 max-w-md text-xs leading-relaxed text-[#86868B]">${escapeHtml(activityLogErrorMessage || '請稍後再試。')}</p>
+                            <button type="button" onclick="${needsLogin ? 'restartActivityLogSession()' : 'refreshActivityLogs()'}" class="mt-4 rounded-xl border border-[#D9D9E3] bg-white px-3.5 py-2 text-[11px] font-bold text-[#0066CC] transition hover:bg-[#F5F8FF]">
+                                ${needsLogin ? '重新登入' : '重新載入'}
+                            </button>
+                        </div>
+                    `;
+                } else if (visibleLogs.length === 0) {
+                    activityBodyMarkup = `
+                        <div class="rounded-[24px] border border-dashed border-[#D9D9E3] bg-[#FAFAFB] px-5 py-10 text-center">
+                            <div class="mx-auto inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-[#E4E4E8] bg-white text-[#86868B]">
+                                <i data-lucide="scroll-text" class="h-5 w-5"></i>
+                            </div>
+                            <h4 class="mt-3 text-sm font-bold text-[#1D1D1F]">尚無符合條件的操作紀錄</h4>
+                            <p class="mt-1.5 text-xs leading-relaxed text-[#86868B]">新增繳交項目、上傳檔案、審核或調整資料後，系統會在此留下紀錄。</p>
+                        </div>
+                    `;
+                } else {
+                    activityBodyMarkup = `
+                        <div class="overflow-hidden rounded-[22px] border border-[#E8E8ED] bg-white divide-y divide-[#EDEDF0]">
+                            ${visibleLogs.map(function(log) {
+                                const timestamp = formatCompactDateTimeLabel(log.Created_At) || '時間未記錄';
+                                const actorName = String(log.Actor_Name || '系統');
+                                const actorRole = getActivityLogRoleLabel(log.Actor_Role);
+                                return `
+                                    <article class="grid grid-cols-1 gap-2 px-4 py-3.5 transition hover:bg-[#FBFBFD] md:grid-cols-[minmax(0,1.45fr)_minmax(150px,.72fr)_minmax(132px,.58fr)] md:items-center md:gap-5 md:px-5">
+                                        <div class="min-w-0">
+                                            <div class="flex flex-wrap items-center gap-2">
+                                                <span class="inline-flex shrink-0 items-center rounded-full border px-2.5 py-1 text-[10px] font-bold ${getActivityLogTone(log)}">${escapeHtml(log.Action || '系統異動')}</span>
+                                                <span class="text-[11px] font-semibold text-[#1D1D1F]">${escapeHtml(log.Summary || '')}</span>
+                                            </div>
+                                        </div>
+                                        <div class="text-[11px] text-[#6E6E73]">
+                                            <span class="font-semibold text-[#1D1D1F]">${escapeHtml(actorName)}</span>
+                                            <span class="text-[#AEAEB2]"> · ${escapeHtml(actorRole)}</span>
+                                        </div>
+                                        <time class="text-[11px] tabular-nums text-[#86868B] md:text-right">${escapeHtml(timestamp)}</time>
+                                    </article>
+                                `;
+                            }).join('')}
+                        </div>
+                    `;
+                }
+
+                container.innerHTML = `
+                    <div class="bg-white border border-[#E8E8ED] rounded-3xl p-5 md:p-6 shadow-sm">
+                        <div class="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+                            <div>
+                                <div class="flex items-center gap-2.5">
+                                    <div class="inline-flex h-9 w-9 items-center justify-center rounded-2xl border border-[#DCE8F8] bg-[#F3F8FF] text-[#0066CC]">
+                                        <i data-lucide="scroll-text" class="h-4.5 w-4.5"></i>
+                                    </div>
+                                    <div>
+                                        <h3 class="text-base font-bold text-[#1D1D1F]">操作紀錄</h3>
+                                        <p class="mt-0.5 text-xs text-[#86868B]">追蹤重要管理、繳交與審核異動。</p>
+                                    </div>
+                                </div>
+                                <p class="mt-3 inline-flex items-center gap-1.5 rounded-full bg-[#F5F5F7] px-3 py-1.5 text-[10px] font-semibold text-[#6E6E73]">
+                                    <i data-lucide="lock-keyhole" class="h-3 w-3"></i> 僅形印組長與形印組員可查看
+                                </p>
+                            </div>
+                            <button type="button" onclick="refreshActivityLogs()" class="inline-flex w-fit items-center gap-1.5 rounded-xl border border-[#E2E2E7] bg-white px-3 py-2 text-[11px] font-bold text-[#1D1D1F] transition hover:bg-[#F5F5F7]">
+                                <i data-lucide="refresh-cw" class="h-3.5 w-3.5"></i> 重新載入
+                            </button>
+                        </div>
+
+                        <div class="mt-5 rounded-2xl bg-[#F5F5F7] p-1.5">
+                            <div class="flex flex-wrap items-center gap-1">${filterMarkup}</div>
+                        </div>
+
+                        <div class="mt-4">${activityBodyMarkup}</div>
+                    </div>
+                `;
+            }
             else if (activeTab === "teams") {
                 const isLeader = effectiveRole === "Leader";
                 const isSuperAdmin = effectiveRole === "SuperAdmin";

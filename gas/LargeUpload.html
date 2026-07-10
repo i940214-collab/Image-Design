@@ -283,6 +283,7 @@
 
       <form id="large-upload-form">
         <input type="hidden" name="uploadMode" value="<?= pageModel.mode ?>">
+        <input type="hidden" name="sessionToken" value="<?= pageModel.sessionToken ?>">
         <input type="hidden" name="sessionKey" value="<?= pageModel.sessionKey ?>">
         <input type="hidden" name="userId" value="<?= pageModel.userId ?>">
         <input type="hidden" name="teamId" value="<?= pageModel.teamId ?>">
@@ -322,6 +323,16 @@
 
     <script>
       const model = <?!= JSON.stringify(pageModel).replace(/<\//g, "<\\/") ?>;
+      // Keep the temporary auth parameter out of the browser's visible history after the page has loaded.
+      if (window.history && window.history.replaceState) {
+        try {
+          const cleanUrl = new URL(window.location.href);
+          cleanUrl.searchParams.delete("sessionToken");
+          window.history.replaceState({}, document.title, cleanUrl.toString());
+        } catch (error) {
+          // The hidden form field still keeps the authenticated upload request intact.
+        }
+      }
       const maxStableBytes = Number(model.maxStableMb || 50) * 1024 * 1024;
       const fileInput = document.getElementById("upload-file");
       const fileSelection = document.getElementById("file-selection");

@@ -16,6 +16,12 @@ var ASSIGNMENT_REMINDER_TRIGGER_HANDLER = 'runScheduledAssignmentReminders';
 var ASSIGNMENT_REMINDER_LOG_META_KEY = 'AssignmentReminderLog';
 var ASSIGNMENT_REMINDER_SETTINGS_META_KEY = 'AssignmentReminderSettings';
 var ASSIGNMENT_REMINDER_DEFAULT_OFFSETS_HOURS = [72, 24, 6];
+var ACTIVITY_LOG_MAX_RECORDS = 1000;
+var AUTH_SESSION_TTL_HOURS = 12;
+var AUTH_SESSION_MAX_PER_USER = 5;
+var AUTH_LOGIN_MAX_ATTEMPTS = 5;
+var AUTH_LOGIN_LOCKOUT_SECONDS = 10 * 60;
+var MIN_PASSWORD_LENGTH = 8;
 
 var TABLE_SCHEMAS = {
   Config_Stages: {
@@ -128,6 +134,21 @@ var TABLE_SCHEMAS = {
       Read: 'boolean'
     }
   },
+  Discussion_Comments: {
+    headers: [
+      'Comment_ID',
+      'Ref_Type',
+      'Ref_ID',
+      'User_ID',
+      'Team_ID',
+      'Author_Name',
+      'Author_Role',
+      'Kind',
+      'Message',
+      'Created_At'
+    ],
+    types: {}
+  },
   Password_Reset_Tokens: {
     headers: [
       'Reset_ID',
@@ -148,6 +169,39 @@ var TABLE_SCHEMAS = {
       Consumed_At_Millis: 'number'
     }
   },
+  Auth_Sessions: {
+    headers: [
+      'Session_ID',
+      'User_ID',
+      'Token_Hash',
+      'Created_At',
+      'Expires_At',
+      'Last_Seen_At',
+      'Revoked_At',
+      'Expires_At_Millis'
+    ],
+    types: {
+      Expires_At_Millis: 'number'
+    }
+  },
+  Activity_Logs: {
+    headers: [
+      'Log_ID',
+      'Created_At',
+      'Actor_User_ID',
+      'Actor_Name',
+      'Actor_Role',
+      'Action',
+      'Summary',
+      'Target_Type',
+      'Target_ID',
+      'Severity',
+      'Metadata'
+    ],
+    types: {
+      Metadata: 'json'
+    }
+  },
   Meta: {
     headers: ['Key', 'Value'],
     types: {
@@ -165,7 +219,7 @@ function doGet(e) {
     }
 
     if (action === 'bootstrap' || action === 'state' || action === 'init') {
-      return jsonResponse_(true, buildClientStateResult_(loadState_()));
+      return jsonResponse_(true, handleBootstrap_(e && e.parameter ? e.parameter : {}));
     }
 
     if (action === 'largeUploadPage') {
@@ -189,7 +243,7 @@ function doPost(e) {
     var result;
 
     if (action === 'bootstrap' || action === 'state') {
-      result = buildClientStateResult_(loadState_());
+      result = handleBootstrap_(payload);
       return jsonResponse_(true, result);
     }
 
@@ -244,22 +298,39 @@ function doPost(e) {
 
     if (action === 'setup') {
       result = withLock_(function() {
+        var setupState = loadState_();
+        var setupUser = requireSessionUser_(setupState, payload, ['SuperAdmin']);
         setupSheets_();
         if (payload.seedDemo === true) {
           persistState_(buildDemoState_());
         }
-        return buildClientStateResult_(loadState_());
+        return buildClientStateResultForUser_(loadState_(), setupUser);
       });
       return jsonResponse_(true, result);
     }
 
     if (action === 'saveState') {
       result = withLock_(function() {
-        if (!payload.state || typeof payload.state !== 'object') {
-          throw new Error('Missing `state` payload for saveState.');
-        }
-        persistState_(payload.state);
-        return buildClientStateResult_(loadState_());
+        return handleSaveState_(payload);
+      });
+      return jsonResponse_(true, result);
+    }
+
+    if (action === 'deletePurchaseItem') {
+      result = withLock_(function() {
+        return handleDeletePurchaseItem_(payload);
+      });
+      return jsonResponse_(true, result);
+    }
+
+    if (action === 'getActivityLogs') {
+      result = handleGetActivityLogs_(payload);
+      return jsonResponse_(true, result);
+    }
+
+    if (action === 'logout') {
+      result = withLock_(function() {
+        return handleLogoutSession_(payload);
       });
       return jsonResponse_(true, result);
     }
@@ -351,9 +422,15 @@ function buildLargeUploadPageModel_(params) {
   var sessionKey = String(params.sessionKey || '').trim();
   var groupKey = String(params.groupKey || '').trim();
 
-  var currentUser = ensureArray_(state.Users).find(function(user) {
-    return String(user.User_ID || '') === userId;
-  }) || null;
+  var currentUser = requireStudentUploadActor_(state, params);
+  if (userId && userId !== String(currentUser.User_ID || '')) {
+    throw new Error('FORBIDDEN: 穩定上傳頁的使用者資訊不符。');
+  }
+  if (teamId && teamId !== String(currentUser.Team_ID || '')) {
+    throw new Error('FORBIDDEN: 穩定上傳頁的小組資訊不符。');
+  }
+  userId = String(currentUser.User_ID || '');
+  teamId = String(currentUser.Team_ID || '');
   var team = ensureArray_(state.Teams).find(function(item) {
     return String(item.Team_ID || '') === teamId;
   }) || null;
@@ -365,9 +442,6 @@ function buildLargeUploadPageModel_(params) {
   }) || null;
 
   if (mode === 'file') {
-    if (!currentUser) {
-      throw new Error('找不到目前登入使用者，請回主頁重新操作。');
-    }
     if (!team || team.Team_ID === 'T00') {
       throw new Error('只有正式小組可以使用一般檔案收件上傳。');
     }
@@ -382,14 +456,14 @@ function buildLargeUploadPageModel_(params) {
   }
 
   if (mode === 'assignment-asset') {
-    if (!currentUser) {
-      throw new Error('找不到目前登入使用者，請回主頁重新操作。');
-    }
     if (!team || team.Team_ID === 'T00') {
       throw new Error('只有正式小組可以使用繳交項目上傳。');
     }
     if (!assignment) {
       throw new Error('找不到指定的繳交項目。');
+    }
+    if (!isAssignmentVisibleToTeam_(state, assignment, teamId)) {
+      throw new Error('FORBIDDEN: 這份作業不在你的繳交範圍內。');
     }
     if (!stage) {
       stage = ensureArray_(state.Config_Stages).find(function(item) {
@@ -407,6 +481,7 @@ function buildLargeUploadPageModel_(params) {
 
   return {
     mode: mode,
+    sessionToken: String(params.sessionToken || '').trim(),
     sessionKey: sessionKey,
     userId: userId,
     teamId: teamId,
@@ -753,6 +828,7 @@ function loadState_() {
     Assignment_Submissions: readTable_(spreadsheet, 'Assignment_Submissions'),
     Files: readTable_(spreadsheet, 'Files'),
     Notifications: readTable_(spreadsheet, 'Notifications'),
+    Discussion_Comments: readTable_(spreadsheet, 'Discussion_Comments'),
     Meta: readMetaSheet_(spreadsheet)
   };
 
@@ -772,17 +848,529 @@ function loadState_() {
   return state;
 }
 
-function persistState_(inputState) {
+function getStateRevision_(state) {
+  var value = Number(state && state.Meta ? state.Meta.State_Revision : 0);
+  return isNaN(value) || value < 0 ? 0 : Math.floor(value);
+}
+
+function persistState_(inputState, options) {
+  options = options || {};
   setupSheets_();
 
   var state = normalizeState_(cloneObject_(inputState));
-  var existingState = loadState_();
+  var existingState = options.existingState || loadState_();
   state = mergeSensitiveState_(state, existingState);
+  state.Meta = state.Meta && typeof state.Meta === 'object' ? state.Meta : {};
+  state.Meta.State_Revision = typeof options.nextRevision === 'number'
+    ? options.nextRevision
+    : getStateRevision_(existingState) + 1;
   sendPendingAssignmentAnnouncementEmails_(state);
   var config = getConfig_();
   var spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
 
   writeStateTables_(spreadsheet, state);
+}
+
+function loadActivityLogs_() {
+  setupSheets_();
+  var config = getConfig_();
+  var spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
+  return readTable_(spreadsheet, 'Activity_Logs').sort(function(a, b) {
+    return String(b.Created_At || '').localeCompare(String(a.Created_At || ''));
+  });
+}
+
+function appendActivityLogEntries_(entries) {
+  var pendingEntries = ensureArray_(entries).filter(function(entry) {
+    return entry && entry.Action && entry.Summary;
+  });
+  if (pendingEntries.length === 0) return;
+
+  setupSheets_();
+  var config = getConfig_();
+  var spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
+  var records = readTable_(spreadsheet, 'Activity_Logs');
+
+  pendingEntries.forEach(function(entry) {
+    var nextEntry = cloneObject_(entry);
+    nextEntry.Log_ID = String(nextEntry.Log_ID || generateSequentialId_('AL', records, 'Log_ID'));
+    nextEntry.Created_At = String(nextEntry.Created_At || nowString_());
+    nextEntry.Actor_User_ID = String(nextEntry.Actor_User_ID || '');
+    nextEntry.Actor_Name = String(nextEntry.Actor_Name || '系統');
+    nextEntry.Actor_Role = String(nextEntry.Actor_Role || 'System');
+    nextEntry.Action = String(nextEntry.Action || '系統異動');
+    nextEntry.Summary = String(nextEntry.Summary || '系統資料已更新。');
+    nextEntry.Target_Type = String(nextEntry.Target_Type || 'system');
+    nextEntry.Target_ID = String(nextEntry.Target_ID || '');
+    nextEntry.Severity = String(nextEntry.Severity || 'normal');
+    nextEntry.Metadata = nextEntry.Metadata && typeof nextEntry.Metadata === 'object'
+      ? nextEntry.Metadata
+      : {};
+    records.unshift(nextEntry);
+  });
+
+  records.sort(function(a, b) {
+    return String(b.Created_At || '').localeCompare(String(a.Created_At || ''));
+  });
+  writeTable_(spreadsheet, 'Activity_Logs', records.slice(0, ACTIVITY_LOG_MAX_RECORDS));
+}
+
+function createActivityLogEntry_(actor, action, summary, targetType, targetId, severity, metadata) {
+  return {
+    Created_At: nowString_(),
+    Actor_User_ID: actor ? String(actor.User_ID || '') : '',
+    Actor_Name: actor ? String(actor.Name || '未具名使用者') : '系統',
+    Actor_Role: actor ? String(actor.Role || '') : 'System',
+    Action: String(action || '系統異動'),
+    Summary: String(summary || '系統資料已更新。'),
+    Target_Type: String(targetType || 'system'),
+    Target_ID: String(targetId || ''),
+    Severity: String(severity || 'normal'),
+    Metadata: metadata && typeof metadata === 'object' ? metadata : {}
+  };
+}
+
+function resolveAuditActor_(state, userId) {
+  var targetId = String(userId || '').trim();
+  if (!targetId) return null;
+  return ensureArray_(state && state.Users).find(function(user) {
+    return String(user.User_ID || '') === targetId;
+  }) || null;
+}
+
+function isShapePrintUser_(user) {
+  return Boolean(user) && ['SuperAdmin', 'Admin'].indexOf(String(user.Role || '')) >= 0;
+}
+
+function buildAuditComparableRecord_(record, excludedFields) {
+  var copy = cloneObject_(record || {});
+  ensureArray_(excludedFields).forEach(function(field) {
+    delete copy[field];
+  });
+  return copy;
+}
+
+function buildAuditCollectionDelta_(beforeItems, afterItems, idField, excludedFields) {
+  var beforeById = {};
+  var afterById = {};
+  ensureArray_(beforeItems).forEach(function(item) {
+    var id = String(item && item[idField] || '');
+    if (id) beforeById[id] = item;
+  });
+  ensureArray_(afterItems).forEach(function(item) {
+    var id = String(item && item[idField] || '');
+    if (id) afterById[id] = item;
+  });
+
+  var created = Object.keys(afterById).filter(function(id) {
+    return !beforeById[id];
+  });
+  var deleted = Object.keys(beforeById).filter(function(id) {
+    return !afterById[id];
+  });
+  var updated = Object.keys(afterById).filter(function(id) {
+    return beforeById[id]
+      && JSON.stringify(buildAuditComparableRecord_(beforeById[id], excludedFields))
+        !== JSON.stringify(buildAuditComparableRecord_(afterById[id], excludedFields));
+  });
+
+  return {
+    created: created,
+    deleted: deleted,
+    updated: updated,
+    afterById: afterById,
+    beforeById: beforeById
+  };
+}
+
+function describeAuditTargets_(ids, recordsById, labelField) {
+  return ensureArray_(ids).slice(0, 2).map(function(id) {
+    var record = recordsById[id] || {};
+    return String(record[labelField] || id);
+  }).join('、');
+}
+
+function buildStateAuditEntries_(beforeState, afterState, actor) {
+  if (!actor) return [];
+
+  var collections = [
+    { key: 'Config_Stages', idField: 'Stage_ID', label: '會審期數', labelField: 'Stage_Name', targetType: 'stage' },
+    { key: 'Purchase_Items', idField: 'Item_ID', label: '印刷品項', labelField: 'Item_Name', targetType: 'purchase' },
+    { key: 'Assignments', idField: 'Assignment_ID', label: '繳交項目', labelField: 'Title', targetType: 'assignment' },
+    { key: 'Assignment_Submissions', idField: 'Submission_ID', label: '繳交紀錄', labelField: 'File_Name', targetType: 'submission' },
+    { key: 'Files', idField: 'File_ID', label: '檔案紀錄', labelField: 'File_Name', targetType: 'file' },
+    { key: 'Users', idField: 'User_ID', label: '帳號與角色', labelField: 'Name', targetType: 'user', excludedFields: ['Password'] },
+    { key: 'Teams', idField: 'Team_ID', label: '小組資料', labelField: 'Team_Name', targetType: 'team' }
+  ];
+
+  var entries = [];
+  collections.forEach(function(config) {
+    var delta = buildAuditCollectionDelta_(
+      beforeState && beforeState[config.key],
+      afterState && afterState[config.key],
+      config.idField,
+      config.excludedFields
+    );
+    var total = delta.created.length + delta.deleted.length + delta.updated.length;
+    if (total === 0) return;
+
+    var action = '更新' + config.label;
+    var sourceIds = delta.updated;
+    var sourceRecords = delta.afterById;
+    if (delta.created.length > 0 && delta.deleted.length === 0 && delta.updated.length === 0) {
+      action = '新增' + config.label;
+      sourceIds = delta.created;
+    } else if (delta.deleted.length > 0 && delta.created.length === 0 && delta.updated.length === 0) {
+      action = '刪除' + config.label;
+      sourceIds = delta.deleted;
+      sourceRecords = delta.beforeById;
+    }
+
+    var parts = [];
+    if (delta.created.length) parts.push('新增 ' + delta.created.length + ' 筆');
+    if (delta.updated.length) parts.push('更新 ' + delta.updated.length + ' 筆');
+    if (delta.deleted.length) parts.push('刪除 ' + delta.deleted.length + ' 筆');
+    var targetText = describeAuditTargets_(sourceIds, sourceRecords, config.labelField);
+    var summary = config.label + '已異動：' + parts.join('、') + (targetText ? '（' + targetText + '）' : '');
+
+    entries.push(createActivityLogEntry_(
+      actor,
+      action,
+      summary,
+      config.targetType,
+      sourceIds[0] || '',
+      delta.deleted.length > 0 ? 'warning' : 'normal',
+      {
+        source: 'saveState',
+        createdIds: delta.created,
+        updatedIds: delta.updated,
+        deletedIds: delta.deleted
+      }
+    ));
+  });
+
+  return entries;
+}
+
+function handleBootstrap_(payload) {
+  var state = loadState_();
+  var sessionContext = requireSessionContext_(state, payload);
+  return buildClientStateResultForUser_(state, sessionContext.user, {
+    sessionExpiresAt: sessionContext.session.Expires_At
+  });
+}
+
+function assertExpectedStateRevision_(payload, state) {
+  var expected = Number(payload && payload.stateRevision);
+  var current = getStateRevision_(state);
+  if (isNaN(expected) || expected !== current) {
+    throw new Error('STATE_CONFLICT: 雲端資料已被其他使用者更新，系統已停止本次覆蓋，請重新載入後再操作。');
+  }
+}
+
+function buildComparableCollection_(items, idField, excludedFields) {
+  return ensureArray_(items).map(function(item) {
+    return buildAuditComparableRecord_(item, excludedFields);
+  }).sort(function(a, b) {
+    return String(a[idField] || '').localeCompare(String(b[idField] || ''));
+  });
+}
+
+function assertCollectionUnchanged_(existing, incoming, key, idField, excludedFields) {
+  var before = JSON.stringify(buildComparableCollection_(existing[key], idField, excludedFields));
+  var after = JSON.stringify(buildComparableCollection_(incoming[key], idField, excludedFields));
+  if (before !== after) {
+    throw new Error('FORBIDDEN: 你沒有修改「' + key + '」的權限。');
+  }
+}
+
+function cloneServerMeta_(state) {
+  return cloneObject_(state && state.Meta && typeof state.Meta === 'object' ? state.Meta : {});
+}
+
+function mergeOwnNotificationReadState_(nextState, incomingState, user) {
+  var incomingById = {};
+  ensureArray_(incomingState.Notifications).forEach(function(notification) {
+    if (String(notification.User_ID || '') === String(user.User_ID || '')) {
+      incomingById[String(notification.Notification_ID || '')] = notification;
+    }
+  });
+  nextState.Notifications.forEach(function(notification) {
+    var incoming = incomingById[String(notification.Notification_ID || '')];
+    if (incoming && String(notification.User_ID || '') === String(user.User_ID || '') && incoming.Read === true) {
+      notification.Read = true;
+    }
+  });
+}
+
+function getStudentDiscussionContext_(state, comment, teamId) {
+  var refType = String(comment && comment.Ref_Type || '');
+  var refId = String(comment && comment.Ref_ID || '');
+  if (refType === 'assignment') {
+    var assignment = ensureArray_(state.Assignments).find(function(item) {
+      return String(item.Assignment_ID || '') === refId;
+    });
+    return assignment && isAssignmentVisibleToTeam_(state, assignment, teamId) ? assignment : null;
+  }
+  if (refType === 'file-group') {
+    var file = ensureArray_(state.Files).find(function(item) {
+      return String(item.File_Group_Key || '') === refId && String(item.Team_ID || '') === teamId;
+    });
+    return file || null;
+  }
+  return null;
+}
+
+function mergeStudentDiscussionComments_(nextState, incomingState, actor) {
+  var existingIds = {};
+  ensureArray_(nextState.Discussion_Comments).forEach(function(comment) {
+    existingIds[String(comment.Comment_ID || '')] = true;
+  });
+
+  ensureArray_(incomingState.Discussion_Comments).forEach(function(comment) {
+    var requestedId = String(comment && comment.Comment_ID || '');
+    if (requestedId && existingIds[requestedId]) return;
+    if (String(comment && comment.Kind || 'comment') === 'system') return;
+    var message = String(comment && comment.Message || '').trim();
+    var context = getStudentDiscussionContext_(nextState, comment, actor.Team_ID);
+    if (!message || !context) return;
+
+    var canonical = hydrateDiscussionCommentRecord_({
+      Comment_ID: generateSequentialId_('CMT', nextState.Discussion_Comments, 'Comment_ID'),
+      Ref_Type: comment.Ref_Type,
+      Ref_ID: comment.Ref_ID,
+      User_ID: actor.User_ID,
+      Team_ID: actor.Team_ID,
+      Author_Name: actor.Name,
+      Author_Role: actor.Role,
+      Kind: 'comment',
+      Message: message.slice(0, 5000),
+      Created_At: nowString_()
+    });
+    nextState.Discussion_Comments.push(canonical);
+    createNotifications_(nextState, {
+      type: 'discussion-comment',
+      title: '小組留言回覆',
+      message: '「' + (context.Title || context.File_Name || '繳交項目') + '」有新的小組留言。',
+      tab: 'files',
+      refType: canonical.Ref_Type,
+      refId: canonical.Ref_ID,
+      audience: { roles: ['SuperAdmin', 'Admin'], excludeUserIds: [actor.User_ID] },
+      createdAt: canonical.Created_At,
+      priority: 'normal'
+    });
+  });
+}
+
+function mergeStudentSubmissions_(nextState, incomingState, actor) {
+  var existingIds = {};
+  ensureArray_(nextState.Assignment_Submissions).forEach(function(submission) {
+    existingIds[String(submission.Submission_ID || '')] = true;
+  });
+
+  ensureArray_(incomingState.Assignment_Submissions).forEach(function(candidate) {
+    var requestedId = String(candidate && candidate.Submission_ID || '');
+    if (requestedId && existingIds[requestedId]) return;
+    if (String(candidate && candidate.Team_ID || '') !== String(actor.Team_ID || '')) return;
+    var assignment = ensureArray_(nextState.Assignments).find(function(item) {
+      return String(item.Assignment_ID || '') === String(candidate.Assignment_ID || '');
+    });
+    if (!assignment || !isAssignmentVisibleToTeam_(nextState, assignment, actor.Team_ID)) return;
+
+    var existingForAssignment = ensureArray_(nextState.Assignment_Submissions).filter(function(item) {
+      return String(item.Assignment_ID || '') === String(assignment.Assignment_ID || '')
+        && String(item.Team_ID || '') === String(actor.Team_ID || '');
+    });
+    if (existingForAssignment.length > 0 && assignment.Allow_ReSubmit !== true) {
+      throw new Error('FORBIDDEN: 此繳交項目目前不開放重新繳交。');
+    }
+
+    var requiresFile = assignment.Submission_Mode === 'file' || assignment.Submission_Mode === 'file-text';
+    var requiresText = assignment.Submission_Mode === 'text' || assignment.Submission_Mode === 'file-text';
+    var fileName = String(candidate.File_Name || '').trim();
+    var textContent = String(candidate.Text_Content || '').trim();
+    if ((requiresFile && !fileName) || (requiresText && !textContent)) {
+      throw new Error('請完成繳交項目要求的檔案或文字內容。');
+    }
+
+    var submissionNo = existingForAssignment.reduce(function(max, item) {
+      return Math.max(max, Number(item.Submission_No || 0));
+    }, 0) + 1;
+    var createdAt = nowString_();
+    var submission = hydrateAssignmentSubmissionRecord_({
+      Submission_ID: generateSequentialId_('SUB', nextState.Assignment_Submissions, 'Submission_ID'),
+      Assignment_ID: assignment.Assignment_ID,
+      User_ID: actor.User_ID,
+      Team_ID: actor.Team_ID,
+      Submission_No: submissionNo,
+      Submission_Mode: assignment.Submission_Mode,
+      File_Name: requiresFile ? fileName : '',
+      Google_Drive_URL: requiresFile ? String(candidate.Google_Drive_URL || '') : '',
+      Text_Content: requiresText ? textContent.slice(0, 10000) : '',
+      Submitted_At: createdAt,
+      Updated_At: createdAt,
+      Status: '已繳交',
+      Notes: '',
+      Drive_File_ID: requiresFile ? String(candidate.Drive_File_ID || '') : '',
+      Drive_Folder_ID: requiresFile ? String(candidate.Drive_Folder_ID || '') : ''
+    });
+    nextState.Assignment_Submissions.unshift(submission);
+    createNotifications_(nextState, {
+      type: 'assignment-submit',
+      title: '小組已繳交作業',
+      message: '「' + assignment.Title + '」已有新的繳交紀錄。',
+      tab: 'files',
+      refType: 'assignment',
+      refId: assignment.Assignment_ID,
+      audience: { roles: ['SuperAdmin', 'Admin'] },
+      createdAt: createdAt,
+      priority: 'normal'
+    });
+    nextState.Discussion_Comments.push(hydrateDiscussionCommentRecord_({
+      Comment_ID: generateSequentialId_('CMT', nextState.Discussion_Comments, 'Comment_ID'),
+      Ref_Type: 'assignment',
+      Ref_ID: assignment.Assignment_ID,
+      User_ID: '',
+      Team_ID: actor.Team_ID,
+      Author_Name: '形印系統',
+      Author_Role: 'System',
+      Kind: 'system',
+      Message: actor.Name + ' 已完成第 ' + submissionNo + ' 次繳交。',
+      Created_At: createdAt
+    }));
+  });
+}
+
+function mergeLeaderInvites_(nextState, incomingState, actor) {
+  if (String(actor.Role || '') !== 'Leader') return;
+  var emails = {};
+  nextState.Users.forEach(function(user) {
+    emails[normalizeEmail_(user.Email)] = true;
+  });
+  ensureArray_(incomingState.Users).forEach(function(candidate) {
+    var requestedId = String(candidate && candidate.User_ID || '');
+    var alreadyExists = nextState.Users.some(function(user) {
+      return String(user.User_ID || '') === requestedId;
+    });
+    if (alreadyExists) return;
+    var email = normalizeEmail_(candidate && candidate.Email);
+    if (!email || emails[email]) return;
+    if (String(candidate && candidate.Team_ID || '') !== String(actor.Team_ID || '')) return;
+    var user = {
+      User_ID: generateSequentialId_('U', nextState.Users, 'User_ID'),
+      Email: email,
+      Password: '',
+      Name: String(candidate && candidate.Name || '待開通成員').slice(0, 120),
+      Team_ID: actor.Team_ID,
+      Role: 'Member',
+      Status: 'Pending'
+    };
+    nextState.Users.push(user);
+    emails[email] = true;
+  });
+}
+
+function mergeClientStateForActor_(existingState, incomingState, actor) {
+  var existing = normalizeState_(cloneObject_(existingState));
+  var incoming = normalizeState_(cloneObject_(incomingState));
+  var nextState;
+
+  if (String(actor.Role || '') === 'SuperAdmin') {
+    nextState = incoming;
+    nextState.Meta = cloneServerMeta_(existing);
+    return nextState;
+  }
+
+  if (String(actor.Role || '') === 'Admin') {
+    ['Config_Stages', 'Users', 'Teams', 'Files', 'Assignment_Submissions'].forEach(function(key) {
+      var idField = key === 'Config_Stages' ? 'Stage_ID'
+        : key === 'Users' ? 'User_ID'
+        : key === 'Teams' ? 'Team_ID'
+        : key === 'Files' ? 'File_ID'
+        : 'Submission_ID';
+      assertCollectionUnchanged_(existing, incoming, key, idField, key === 'Users' ? ['Password'] : []);
+    });
+    nextState = existing;
+    nextState.Purchase_Items = incoming.Purchase_Items;
+    nextState.Assignments = incoming.Assignments;
+    nextState.Discussion_Comments = incoming.Discussion_Comments;
+    mergeOwnNotificationReadState_(nextState, incoming, actor);
+    nextState.Meta = cloneServerMeta_(existing);
+    return nextState;
+  }
+
+  nextState = existing;
+  mergeStudentSubmissions_(nextState, incoming, actor);
+  mergeStudentDiscussionComments_(nextState, incoming, actor);
+  mergeLeaderInvites_(nextState, incoming, actor);
+  mergeOwnNotificationReadState_(nextState, incoming, actor);
+  nextState.Meta = cloneServerMeta_(existing);
+  return nextState;
+}
+
+function handleSaveState_(payload) {
+  if (!payload.state || typeof payload.state !== 'object') {
+    throw new Error('Missing `state` payload for saveState.');
+  }
+  var previousState = loadState_();
+  var actor = requireSessionUser_(previousState, payload);
+  assertExpectedStateRevision_(payload, previousState);
+  var mergedState = mergeClientStateForActor_(previousState, payload.state, actor);
+  persistState_(mergedState, {
+    existingState: previousState,
+    nextRevision: getStateRevision_(previousState) + 1
+  });
+  var nextState = loadState_();
+  appendActivityLogEntries_(buildStateAuditEntries_(previousState, nextState, actor));
+  return buildClientStateResultForUser_(nextState, actor);
+}
+
+// Delete one purchase record from the latest server state so a stale browser
+// snapshot can never restore it after the action has completed.
+function handleDeletePurchaseItem_(payload) {
+  var previousState = loadState_();
+  var actor = requireSessionUser_(previousState, payload, ['SuperAdmin', 'Admin']);
+  var itemId = String(payload && payload.itemId || '').trim();
+
+  if (!itemId) {
+    throw new Error('deletePurchaseItem requires `itemId`.');
+  }
+
+  var targetItem = ensureArray_(previousState.Purchase_Items).find(function(item) {
+    return String(item && item.Item_ID || '') === itemId;
+  });
+
+  if (!targetItem) {
+    throw new Error('NOT_FOUND: 找不到要刪除的發包品項，資料可能已被其他使用者更新。');
+  }
+
+  var nextState = cloneObject_(previousState);
+  nextState.Purchase_Items = ensureArray_(nextState.Purchase_Items).filter(function(item) {
+    return String(item && item.Item_ID || '') !== itemId;
+  });
+
+  persistState_(nextState, {
+    existingState: previousState,
+    nextRevision: getStateRevision_(previousState) + 1
+  });
+
+  var savedState = loadState_();
+  appendActivityLogEntries_(buildStateAuditEntries_(previousState, savedState, actor));
+
+  return buildClientStateResultForUser_(savedState, actor, {
+    deletedItem: targetItem
+  });
+}
+
+function handleGetActivityLogs_(payload) {
+  var state = loadState_();
+  var viewer = requireSessionUser_(state, payload, ['SuperAdmin', 'Admin']);
+  if (!isShapePrintUser_(viewer)) {
+    throw new Error('FORBIDDEN: 操作紀錄僅限形印組查看。');
+  }
+  var requestedLimit = Number(payload && payload.limit || 100);
+  var limit = Math.max(1, Math.min(200, isNaN(requestedLimit) ? 100 : requestedLimit));
+  return { logs: loadActivityLogs_().slice(0, limit) };
 }
 
 function loadPasswordResetTokens_() {
@@ -818,6 +1406,7 @@ function writeStateTables_(spreadsheet, state) {
   writeTable_(spreadsheet, 'Assignment_Submissions', state.Assignment_Submissions);
   writeTable_(spreadsheet, 'Files', state.Files);
   writeTable_(spreadsheet, 'Notifications', state.Notifications);
+  writeTable_(spreadsheet, 'Discussion_Comments', state.Discussion_Comments);
   writeMetaSheet_(spreadsheet, state.Meta || {});
 }
 
@@ -842,6 +1431,238 @@ function sanitizeUserRecord_(user) {
   var safeUser = cloneObject_(user);
   safeUser.Password = '';
   return safeUser;
+}
+
+function loadAuthSessions_() {
+  setupSheets_();
+  var config = getConfig_();
+  var spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
+  return readTable_(spreadsheet, 'Auth_Sessions').map(function(record) {
+    return normalizeAuthSessionRecord_(record);
+  });
+}
+
+function persistAuthSessions_(records) {
+  setupSheets_();
+  var config = getConfig_();
+  var spreadsheet = SpreadsheetApp.openById(config.spreadsheetId);
+  var normalized = ensureArray_(records).map(function(record) {
+    return normalizeAuthSessionRecord_(record);
+  }).filter(function(record) {
+    return record.Session_ID && record.Token_Hash;
+  });
+  writeTable_(spreadsheet, 'Auth_Sessions', normalized);
+}
+
+function normalizeAuthSessionRecord_(record) {
+  if (!record || typeof record !== 'object') {
+    record = {};
+  }
+  record.Session_ID = String(record.Session_ID || '');
+  record.User_ID = String(record.User_ID || '');
+  record.Token_Hash = String(record.Token_Hash || '');
+  record.Created_At = String(record.Created_At || '');
+  record.Expires_At = String(record.Expires_At || '');
+  record.Last_Seen_At = String(record.Last_Seen_At || '');
+  record.Revoked_At = String(record.Revoked_At || '');
+  record.Expires_At_Millis = Number(record.Expires_At_Millis || 0);
+  return record;
+}
+
+function hashSessionToken_(token) {
+  var digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    String(token || ''),
+    Utilities.Charset.UTF_8
+  );
+  return Utilities.base64EncodeWebSafe(digest);
+}
+
+function cleanupAuthSessions_(records) {
+  var cutoff = Date.now() - (7 * 24 * 60 * 60 * 1000);
+  return ensureArray_(records).filter(function(record) {
+    var expiresAt = Number(record.Expires_At_Millis || 0);
+    return expiresAt === 0 || expiresAt >= cutoff;
+  });
+}
+
+function issueSession_(user) {
+  var sessions = cleanupAuthSessions_(loadAuthSessions_());
+  var now = new Date();
+  var expiresAt = new Date(now.getTime() + (AUTH_SESSION_TTL_HOURS * 60 * 60 * 1000));
+  var rawToken = Utilities.getUuid().replace(/-/g, '') + Utilities.getUuid().replace(/-/g, '');
+  var activeSessions = sessions.filter(function(session) {
+    return session.User_ID === String(user.User_ID || '')
+      && !session.Revoked_At
+      && Number(session.Expires_At_Millis || 0) > now.getTime();
+  }).sort(function(a, b) {
+    return Number(a.Expires_At_Millis || 0) - Number(b.Expires_At_Millis || 0);
+  });
+
+  while (activeSessions.length >= AUTH_SESSION_MAX_PER_USER) {
+    var oldest = activeSessions.shift();
+    oldest.Revoked_At = formatDateTime_(now);
+  }
+
+  sessions.unshift(normalizeAuthSessionRecord_({
+    Session_ID: generateSequentialId_('SES', sessions, 'Session_ID'),
+    User_ID: String(user.User_ID || ''),
+    Token_Hash: hashSessionToken_(rawToken),
+    Created_At: formatDateTime_(now),
+    Expires_At: formatDateTime_(expiresAt),
+    Last_Seen_At: formatDateTime_(now),
+    Revoked_At: '',
+    Expires_At_Millis: expiresAt.getTime()
+  }));
+  persistAuthSessions_(sessions);
+
+  return {
+    token: rawToken,
+    expiresAt: formatDateTime_(expiresAt)
+  };
+}
+
+function requireSessionContext_(state, payload, allowedRoles) {
+  var rawToken = String(payload && payload.sessionToken || '').trim();
+  if (!rawToken) {
+    throw new Error('AUTH_REQUIRED: 請重新登入後再繼續。');
+  }
+
+  var tokenHash = hashSessionToken_(rawToken);
+  var now = Date.now();
+  var sessions = cleanupAuthSessions_(loadAuthSessions_());
+  var session = sessions.find(function(item) {
+    return item.Token_Hash === tokenHash
+      && !item.Revoked_At
+      && Number(item.Expires_At_Millis || 0) > now;
+  }) || null;
+  if (!session) {
+    throw new Error('AUTH_EXPIRED: 登入狀態已過期，請重新登入。');
+  }
+
+  var user = ensureArray_(state && state.Users).find(function(item) {
+    return String(item.User_ID || '') === session.User_ID;
+  }) || null;
+  if (!user || String(user.Status || '') !== 'Active') {
+    throw new Error('AUTH_EXPIRED: 帳號目前無法使用，請重新登入。');
+  }
+  if (ensureArray_(allowedRoles).length > 0 && ensureArray_(allowedRoles).indexOf(String(user.Role || '')) === -1) {
+    throw new Error('FORBIDDEN: 你沒有執行這項操作的權限。');
+  }
+
+  return { user: user, session: session };
+}
+
+function requireSessionUser_(state, payload, allowedRoles) {
+  return requireSessionContext_(state, payload, allowedRoles).user;
+}
+
+function handleLogoutSession_(payload) {
+  var rawToken = String(payload && payload.sessionToken || '').trim();
+  if (!rawToken) return { revoked: false };
+  var tokenHash = hashSessionToken_(rawToken);
+  var sessions = loadAuthSessions_();
+  var changed = false;
+  sessions.forEach(function(session) {
+    if (session.Token_Hash === tokenHash && !session.Revoked_At) {
+      session.Revoked_At = nowString_();
+      changed = true;
+    }
+  });
+  if (changed) persistAuthSessions_(sessions);
+  return { revoked: changed };
+}
+
+function revokeAllSessionsForUser_(userId) {
+  var targetUserId = String(userId || '').trim();
+  if (!targetUserId) return;
+  var sessions = loadAuthSessions_();
+  var changed = false;
+  sessions.forEach(function(session) {
+    if (session.User_ID === targetUserId && !session.Revoked_At) {
+      session.Revoked_At = nowString_();
+      changed = true;
+    }
+  });
+  if (changed) persistAuthSessions_(sessions);
+}
+
+function requireStudentUploadActor_(state, payload) {
+  var actor = requireSessionUser_(state, payload, ['Leader', 'Member']);
+  if (!actor.Team_ID || actor.Team_ID === 'T00') {
+    throw new Error('FORBIDDEN: 只有已加入正式小組的帳號可以上傳檔案。');
+  }
+  var requestedTeamId = String(payload && payload.teamId || '').trim();
+  if (requestedTeamId && requestedTeamId !== String(actor.Team_ID || '')) {
+    throw new Error('FORBIDDEN: 不可替其他小組上傳檔案。');
+  }
+  return actor;
+}
+
+function isAssignmentVisibleToTeam_(state, assignment, teamId) {
+  return getAssignmentTargetTeamIds_(state, assignment).indexOf(String(teamId || '')) >= 0;
+}
+
+function filterStateForUser_(state, user) {
+  var safeState = sanitizeStateForClient_(state);
+  if (isShapePrintUser_(user)) {
+    safeState.Meta = { State_Revision: getStateRevision_(state) };
+    return safeState;
+  }
+
+  var teamId = String(user.Team_ID || '');
+  var visibleAssignments = safeState.Assignments.filter(function(assignment) {
+    return isAssignmentVisibleToTeam_(state, assignment, teamId);
+  });
+  var visibleAssignmentIds = {};
+  visibleAssignments.forEach(function(assignment) {
+    visibleAssignmentIds[String(assignment.Assignment_ID || '')] = true;
+    if (String(assignment.Target_Mode || '') === 'selected') {
+      assignment.Target_Team_IDs = [teamId];
+    }
+  });
+
+  safeState.Users = safeState.Users.filter(function(item) {
+    return String(item.Team_ID || '') === teamId;
+  });
+  safeState.Teams = safeState.Teams.filter(function(item) {
+    return String(item.Team_ID || '') === teamId;
+  });
+  safeState.Config_Stages = safeState.Config_Stages.map(function(stage) {
+    stage.Budget_Allocated = 0;
+    return stage;
+  });
+  safeState.Purchase_Items = safeState.Purchase_Items.map(function(item) {
+    item.Vendor_Price = 0;
+    item.Subtotal = 0;
+    return item;
+  });
+  safeState.Assignments = visibleAssignments;
+  safeState.Assignment_Submissions = safeState.Assignment_Submissions.filter(function(item) {
+    return String(item.Team_ID || '') === teamId;
+  });
+  safeState.Files = safeState.Files.filter(function(item) {
+    return String(item.Team_ID || '') === teamId;
+  });
+  safeState.Notifications = safeState.Notifications.filter(function(item) {
+    return String(item.User_ID || '') === String(user.User_ID || '');
+  });
+  safeState.Discussion_Comments = safeState.Discussion_Comments.filter(function(comment) {
+    return String(comment.Team_ID || '') === teamId
+      || (String(comment.Ref_Type || '') === 'assignment' && visibleAssignmentIds[String(comment.Ref_ID || '')]);
+  });
+  safeState.Meta = { State_Revision: getStateRevision_(state) };
+  return safeState;
+}
+
+function buildClientStateResultForUser_(state, user, extraData) {
+  var result = cloneObject_(extraData || {});
+  var safeState = filterStateForUser_(state, user);
+  result.state = safeState;
+  result.currentUser = sanitizeUserRecord_(user);
+  result.stateRevision = getStateRevision_(state);
+  result.heatmap = buildHeatmapStats_(safeState);
+  return result;
 }
 
 function mergeSensitiveState_(nextState, existingState) {
@@ -1050,6 +1871,7 @@ function normalizeState_(state) {
   });
   state.Files = ensureArray_(state.Files);
   state.Notifications = ensureArray_(state.Notifications);
+  state.Discussion_Comments = ensureArray_(state.Discussion_Comments);
   state.Meta = state.Meta && typeof state.Meta === 'object' ? state.Meta : {};
 
   state.Files = state.Files.map(function(file) {
@@ -1059,6 +1881,9 @@ function normalizeState_(state) {
 
   state.Notifications = state.Notifications.map(function(notification) {
     return hydrateNotificationRecord_(notification);
+  });
+  state.Discussion_Comments = state.Discussion_Comments.map(function(comment) {
+    return hydrateDiscussionCommentRecord_(comment);
   });
 
   if (state.Notifications.length > 0 && typeof state.Meta.NotificationSeeded === 'undefined') {
@@ -1797,6 +2622,25 @@ function hydrateNotificationRecord_(notification) {
   return notification;
 }
 
+function hydrateDiscussionCommentRecord_(comment) {
+  if (!comment || typeof comment !== 'object') {
+    comment = {};
+  }
+
+  comment.Comment_ID = String(comment.Comment_ID || '');
+  comment.Ref_Type = String(comment.Ref_Type || '');
+  comment.Ref_ID = String(comment.Ref_ID || '');
+  comment.User_ID = String(comment.User_ID || '');
+  comment.Team_ID = String(comment.Team_ID || '');
+  comment.Author_Name = String(comment.Author_Name || '未具名');
+  comment.Author_Role = String(comment.Author_Role || '');
+  comment.Kind = String(comment.Kind || 'comment');
+  comment.Message = String(comment.Message || '');
+  comment.Created_At = normalizeDateTimeStorageValue_(comment.Created_At || nowString_());
+
+  return comment;
+}
+
 function normalizePasswordResetTokenRecord_(record) {
   if (!record || typeof record !== 'object') {
     record = {};
@@ -2106,18 +2950,23 @@ function handleLogin_(payload) {
     throw new Error('登入需要電子郵件與密碼。');
   }
 
+  assertLoginAttemptAllowed_(email);
+
   var user = findUserByEmail_(state.Users, email);
   if (!user) {
-    throw new Error('無效的帳號或密碼。');
+    throwLoginFailure_(email);
   }
 
   if (String(user.Status || '') === 'Pending') {
+    recordFailedLoginAttempt_(email);
     throw new Error('此帳號尚未啟用，請改用信箱開通流程。');
   }
 
   if (!verifyPassword_(password, user.Password)) {
-    throw new Error('無效的帳號或密碼。');
+    throwLoginFailure_(email);
   }
+
+  clearFailedLoginAttempts_(email);
 
   if (!isPasswordHash_(user.Password)) {
     user.Password = hashPassword_(password);
@@ -2126,9 +2975,71 @@ function handleLogin_(payload) {
     user = findUserByEmail_(state.Users, email);
   }
 
-  return buildClientStateResult_(state, {
-    currentUser: sanitizeUserRecord_(user)
-  });
+  if (isShapePrintUser_(user)) {
+    appendActivityLogEntries_([
+      createActivityLogEntry_(user, '登入系統', '已登入形印組工作台。', 'session', '', 'info', {
+        source: 'login'
+      })
+    ]);
+  }
+
+  return buildAuthenticatedClientResult_(state, user);
+}
+
+function getLoginAttemptCacheKey_(email) {
+  return 'login-attempt:' + hashSessionToken_(normalizeEmail_(email));
+}
+
+function getLoginAttemptState_(email) {
+  var raw = CacheService.getScriptCache().get(getLoginAttemptCacheKey_(email));
+  if (!raw) return { count: 0, lockedUntil: 0 };
+  try {
+    var parsed = JSON.parse(raw);
+    return {
+      count: Number(parsed.count || 0),
+      lockedUntil: Number(parsed.lockedUntil || 0)
+    };
+  } catch (error) {
+    return { count: 0, lockedUntil: 0 };
+  }
+}
+
+function assertLoginAttemptAllowed_(email) {
+  var attempt = getLoginAttemptState_(email);
+  if (attempt.lockedUntil > Date.now()) {
+    throw new Error('登入嘗試過多，請 10 分鐘後再試。');
+  }
+}
+
+function recordFailedLoginAttempt_(email) {
+  var cache = CacheService.getScriptCache();
+  var attempt = getLoginAttemptState_(email);
+  var count = Number(attempt.count || 0) + 1;
+  var lockedUntil = count >= AUTH_LOGIN_MAX_ATTEMPTS
+    ? Date.now() + (AUTH_LOGIN_LOCKOUT_SECONDS * 1000)
+    : 0;
+  cache.put(
+    getLoginAttemptCacheKey_(email),
+    JSON.stringify({ count: count, lockedUntil: lockedUntil }),
+    AUTH_LOGIN_LOCKOUT_SECONDS
+  );
+}
+
+function clearFailedLoginAttempts_(email) {
+  CacheService.getScriptCache().remove(getLoginAttemptCacheKey_(email));
+}
+
+function throwLoginFailure_(email) {
+  recordFailedLoginAttempt_(email);
+  throw new Error('無效的帳號或密碼。');
+}
+
+function buildAuthenticatedClientResult_(state, user, extraData) {
+  var session = issueSession_(user);
+  var data = cloneObject_(extraData || {});
+  data.sessionToken = session.token;
+  data.sessionExpiresAt = session.expiresAt;
+  return buildClientStateResultForUser_(state, user, data);
 }
 
 function handleRegisterLeader_(payload) {
@@ -2167,8 +3078,13 @@ function handleRegisterLeader_(payload) {
   persistState_(state);
   state = loadState_();
 
-  return buildClientStateResult_(state, {
-    currentUser: sanitizeUserRecord_(findUserByEmail_(state.Users, email)),
+  appendActivityLogEntries_([
+    createActivityLogEntry_(newUser, '建立小組帳號', '已建立小組「' + newTeam.Team_Name + '」與組長帳號。', 'team', newTeam.Team_ID, 'normal', {
+      source: 'registerLeader'
+    })
+  ]);
+
+  return buildAuthenticatedClientResult_(state, findUserByEmail_(state.Users, email), {
     team: newTeam
   });
 }
@@ -2208,8 +3124,13 @@ function handleRegisterMember_(payload) {
   persistState_(state);
   state = loadState_();
 
-  return buildClientStateResult_(state, {
-    currentUser: sanitizeUserRecord_(findUserByEmail_(state.Users, email)),
+  appendActivityLogEntries_([
+    createActivityLogEntry_(newUser, '加入小組', '已使用邀請碼加入「' + targetTeam.Team_Name + '」。', 'team', targetTeam.Team_ID, 'normal', {
+      source: 'registerMember'
+    })
+  ]);
+
+  return buildAuthenticatedClientResult_(state, findUserByEmail_(state.Users, email), {
     team: targetTeam
   });
 }
@@ -2233,9 +3154,13 @@ function handleActivatePending_(payload) {
   persistState_(state);
   state = loadState_();
 
-  return buildClientStateResult_(state, {
-    currentUser: sanitizeUserRecord_(findUserByEmail_(state.Users, email))
-  });
+  appendActivityLogEntries_([
+    createActivityLogEntry_(targetUser, '開通帳號', '已完成帳號開通。', 'user', targetUser.User_ID, 'normal', {
+      source: 'activatePending'
+    })
+  ]);
+
+  return buildAuthenticatedClientResult_(state, findUserByEmail_(state.Users, email));
 }
 
 function handleRequestPasswordReset_(payload) {
@@ -2337,8 +3262,8 @@ function handleResetPassword_(payload) {
     throw new Error('缺少重設密碼驗證碼。');
   }
 
-  if (password.length < 3) {
-    throw new Error('密碼至少需要 3 碼。');
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    throw new Error('密碼至少需要 ' + MIN_PASSWORD_LENGTH + ' 碼。');
   }
 
   var state = loadState_();
@@ -2361,6 +3286,7 @@ function handleResetPassword_(payload) {
   }
 
   user.Password = hashPassword_(password);
+  revokeAllSessionsForUser_(user.User_ID);
   markPasswordResetRecord_(record, 'used');
   invalidatePasswordResetTokensForUser_(tokens, user.User_ID, 'replaced', {
     excludeResetId: record.Reset_ID
@@ -2368,6 +3294,12 @@ function handleResetPassword_(payload) {
 
   persistState_(state);
   persistPasswordResetTokens_(tokens);
+
+  appendActivityLogEntries_([
+    createActivityLogEntry_(user, '更新密碼', '已透過重設流程更新登入密碼。', 'user', user.User_ID, 'warning', {
+      source: 'resetPassword'
+    })
+  ]);
 
   return {
     message: '密碼已更新，請重新登入。',
@@ -2377,42 +3309,27 @@ function handleResetPassword_(payload) {
 
 function handleUploadFile_(payload) {
   var state = loadState_();
-  var userId = String(payload.userId || payload.currentUserId || '').trim();
+  var currentUser = requireStudentUploadActor_(state, payload);
   var fileName = String(payload.fileName || payload.sourceFileName || '').trim();
-  var driveUrl = String(payload.googleDriveUrl || payload.driveUrl || payload.url || '').trim();
   var fileContentBase64 = String(payload.fileContentBase64 || payload.base64 || '').trim();
   var mimeType = String(payload.mimeType || 'application/octet-stream').trim();
   var stageId = String(payload.stageId || '').trim();
   var teamId = String(payload.teamId || '').trim();
   var fileSize = Number(payload.fileSize || 0);
 
-  if (!userId) {
-    throw new Error('uploadFile requires `userId`.');
-  }
-
   if (!fileName) {
     throw new Error('uploadFile requires `fileName`.');
   }
 
-  if (!driveUrl && !fileContentBase64) {
-    throw new Error('uploadFile requires `googleDriveUrl` or `fileContentBase64`.');
+  if (!fileContentBase64) {
+    throw new Error('請直接選擇要上傳的檔案。');
   }
 
   if (fileSize > MAX_BROWSER_UPLOAD_SIZE_BYTES) {
     throw new Error('檔案超過目前直傳上限 18 MB。');
   }
 
-  var currentUser = state.Users.find(function(user) {
-    return user.User_ID === userId;
-  });
-  if (!currentUser) {
-    throw new Error('User not found: ' + userId);
-  }
-
-  var effectiveTeamId = teamId || currentUser.Team_ID;
-  if (!effectiveTeamId || effectiveTeamId === 'T00') {
-    throw new Error('Only approved teams can submit assignment attachments.');
-  }
+  var effectiveTeamId = currentUser.Team_ID;
 
   var activeStage = stageId
     ? state.Config_Stages.find(function(stage) { return stage.Stage_ID === stageId; })
@@ -2456,9 +3373,13 @@ function handleUploadFile_(payload) {
   var nextVersion = Math.max(highestVersion + 1, Number(payload.nextVersion || parsedFile.parsedVersion || 1));
   var storedFileName = buildVersionedFileName_(baseName, nextVersion, extension);
   var uploadNote = latestFile ? '退件後重新繳交' : '首次繳交';
-  var driveResult = driveUrl
-    ? routeDriveFile_(driveUrl, activeStage.Stage_Name, team.Team_Name, storedFileName)
-    : createDriveFileFromBase64_(fileContentBase64, mimeType, fileName, [activeStage.Stage_Name, team.Team_Name], storedFileName);
+  var driveResult = createDriveFileFromBase64_(
+    fileContentBase64,
+    mimeType,
+    fileName,
+    [activeStage.Stage_Name, team.Team_Name],
+    storedFileName
+  );
   var uploadTime = nowString_();
   var nextFileId = generateSequentialId_('F', state.Files, 'File_ID');
 
@@ -2499,26 +3420,37 @@ function handleUploadFile_(payload) {
   });
 
   persistState_(state);
+  state = loadState_();
 
-  return buildClientStateResult_(state, {
-    file: createdFile,
+  appendActivityLogEntries_([
+    createActivityLogEntry_(
+      currentUser,
+      nextVersion > 1 ? '重新繳交檔案' : '上傳檔案',
+      '已將「' + storedFileName + '」送入「' + activeStage.Stage_Name + '」的 ' + team.Team_Name + ' 收件資料夾。',
+      'file',
+      nextFileId,
+      nextVersion > 1 ? 'warning' : 'normal',
+      { source: 'uploadFile', teamId: effectiveTeamId, stageId: activeStage.Stage_ID, version: nextVersion }
+    )
+  ]);
+
+  return buildClientStateResultForUser_(state, currentUser, {
+    file: state.Files.find(function(file) {
+      return file.File_ID === createdFile.File_ID;
+    }) || createdFile,
     drive: driveResult
   });
 }
 
 function handleUploadAssignmentAsset_(payload) {
   var state = loadState_();
-  var userId = String(payload.userId || payload.currentUserId || '').trim();
+  var currentUser = requireStudentUploadActor_(state, payload);
   var assignmentId = String(payload.assignmentId || '').trim();
   var fileName = String(payload.fileName || payload.sourceFileName || '').trim();
   var fileContentBase64 = String(payload.fileContentBase64 || payload.base64 || '').trim();
   var mimeType = String(payload.mimeType || 'application/octet-stream').trim();
   var teamId = String(payload.teamId || '').trim();
   var fileSize = Number(payload.fileSize || 0);
-
-  if (!userId) {
-    throw new Error('uploadAssignmentAsset requires `userId`.');
-  }
 
   if (!assignmentId) {
     throw new Error('uploadAssignmentAsset requires `assignmentId`.');
@@ -2536,13 +3468,6 @@ function handleUploadAssignmentAsset_(payload) {
     throw new Error('檔案超過目前直傳上限 18 MB。');
   }
 
-  var currentUser = state.Users.find(function(user) {
-    return user.User_ID === userId;
-  });
-  if (!currentUser) {
-    throw new Error('User not found: ' + userId);
-  }
-
   var assignment = ensureArray_(state.Assignments).find(function(item) {
     return String(item.Assignment_ID || '') === assignmentId;
   });
@@ -2550,10 +3475,7 @@ function handleUploadAssignmentAsset_(payload) {
     throw new Error('Assignment not found: ' + assignmentId);
   }
 
-  var effectiveTeamId = teamId || currentUser.Team_ID;
-  if (!effectiveTeamId || effectiveTeamId === 'T00') {
-    throw new Error('Only approved teams can submit assignment attachments.');
-  }
+  var effectiveTeamId = currentUser.Team_ID;
 
   if (getAssignmentTargetTeamIds_(state, assignment).indexOf(effectiveTeamId) === -1) {
     throw new Error('這份作業不在此小組的目標範圍內。');
@@ -2621,6 +3543,7 @@ function handleUploadAssignmentAsset_(payload) {
 
 function handleLargeFileFormUpload_(payload) {
   var state = loadState_();
+  var currentUser = requireStudentUploadActor_(state, payload);
   var userId = String(payload.userId || '').trim();
   var stageId = String(payload.stageId || '').trim();
   var teamId = String(payload.teamId || '').trim();
@@ -2634,25 +3557,15 @@ function handleLargeFileFormUpload_(payload) {
   var actualFileName = sanitizeDriveEntryName_(blob.getName && blob.getName(), sourceFileName || 'upload.bin');
   var parsedActualFile = parseFileMeta_(actualFileName);
 
-  if (!userId) {
-    throw new Error('穩定上傳缺少 userId。');
+  if (userId && userId !== String(currentUser.User_ID || '')) {
+    throw new Error('FORBIDDEN: 穩定上傳的使用者資訊不符。');
   }
 
   if (fileSize > MAX_STABLE_WEBAPP_UPLOAD_SIZE_BYTES) {
     throw new Error('檔案超過穩定上傳頁 50 MB 上限。');
   }
 
-  var currentUser = state.Users.find(function(user) {
-    return user.User_ID === userId;
-  });
-  if (!currentUser) {
-    throw new Error('User not found: ' + userId);
-  }
-
-  var effectiveTeamId = teamId || currentUser.Team_ID;
-  if (!effectiveTeamId || effectiveTeamId === 'T00') {
-    throw new Error('Only approved teams can submit assignment attachments.');
-  }
+  var effectiveTeamId = currentUser.Team_ID;
 
   var activeStage = stageId
     ? state.Config_Stages.find(function(stage) { return stage.Stage_ID === stageId; })
@@ -2737,6 +3650,18 @@ function handleLargeFileFormUpload_(payload) {
 
   persistState_(state);
 
+  appendActivityLogEntries_([
+    createActivityLogEntry_(
+      currentUser,
+      nextVersion > 1 ? '重新繳交檔案' : '上傳檔案',
+      '已透過穩定上傳將「' + storedFileName + '」送入「' + activeStage.Stage_Name + '」的 ' + team.Team_Name + ' 收件資料夾。',
+      'file',
+      nextFileId,
+      nextVersion > 1 ? 'warning' : 'normal',
+      { source: 'largeFileUpload', teamId: effectiveTeamId, stageId: activeStage.Stage_ID, version: nextVersion }
+    )
+  ]);
+
   return {
     status: 'success',
     mode: 'file',
@@ -2753,6 +3678,7 @@ function handleLargeFileFormUpload_(payload) {
 
 function handleLargeAssignmentAssetFormUpload_(payload) {
   var state = loadState_();
+  var currentUser = requireStudentUploadActor_(state, payload);
   var userId = String(payload.userId || '').trim();
   var assignmentId = String(payload.assignmentId || '').trim();
   var teamId = String(payload.teamId || '').trim();
@@ -2764,8 +3690,8 @@ function handleLargeAssignmentAssetFormUpload_(payload) {
   var parsedFile = parseFileMeta_(actualFileName);
   var extension = String(parsedFile.extension || '').trim();
 
-  if (!userId) {
-    throw new Error('穩定上傳缺少 userId。');
+  if (userId && userId !== String(currentUser.User_ID || '')) {
+    throw new Error('FORBIDDEN: 穩定上傳的使用者資訊不符。');
   }
   if (!assignmentId) {
     throw new Error('穩定上傳缺少 assignmentId。');
@@ -2780,13 +3706,6 @@ function handleLargeAssignmentAssetFormUpload_(payload) {
     throw new Error('目前只支援 ai、pdf、psd、indd、圖像格式與 zip。');
   }
 
-  var currentUser = state.Users.find(function(user) {
-    return user.User_ID === userId;
-  });
-  if (!currentUser) {
-    throw new Error('User not found: ' + userId);
-  }
-
   var assignment = ensureArray_(state.Assignments).find(function(item) {
     return String(item.Assignment_ID || '') === assignmentId;
   });
@@ -2794,10 +3713,7 @@ function handleLargeAssignmentAssetFormUpload_(payload) {
     throw new Error('Assignment not found: ' + assignmentId);
   }
 
-  var effectiveTeamId = teamId || currentUser.Team_ID;
-  if (!effectiveTeamId || effectiveTeamId === 'T00') {
-    throw new Error('Only approved teams can submit assignment attachments.');
-  }
+  var effectiveTeamId = currentUser.Team_ID;
   if (getAssignmentTargetTeamIds_(state, assignment).indexOf(effectiveTeamId) === -1) {
     throw new Error('這份作業不在此小組的目標範圍內。');
   }
@@ -2857,14 +3773,10 @@ function handleLargeAssignmentAssetFormUpload_(payload) {
 
 function handleReviewFile_(payload) {
   var state = loadState_();
-  var reviewerUserId = String(payload.reviewerUserId || payload.userId || '').trim();
+  var reviewer = requireSessionUser_(state, payload, ['SuperAdmin', 'Admin']);
   var fileId = String(payload.fileId || '').trim();
   var status = String(payload.status || '').trim();
   var comment = String(payload.comment || '').trim();
-
-  if (!reviewerUserId) {
-    throw new Error('reviewFile requires `reviewerUserId`.');
-  }
 
   if (!fileId) {
     throw new Error('reviewFile requires `fileId`.');
@@ -2876,17 +3788,6 @@ function handleReviewFile_(payload) {
 
   if (['未審', '通過', '退件'].indexOf(status) === -1) {
     throw new Error('Unsupported review status: ' + status);
-  }
-
-  var reviewer = state.Users.find(function(user) {
-    return user.User_ID === reviewerUserId;
-  });
-  if (!reviewer) {
-    throw new Error('Reviewer not found: ' + reviewerUserId);
-  }
-
-  if (['SuperAdmin', 'Admin'].indexOf(reviewer.Role) === -1) {
-    throw new Error('Only exhibition admins can review files.');
   }
 
   var targetFile = state.Files.find(function(file) {
@@ -2923,23 +3824,35 @@ function handleReviewFile_(payload) {
   });
 
   persistState_(state);
+  state = loadState_();
 
-  return buildClientStateResult_(state, {
-    file: hydrateFileRecord_(targetFile)
+  appendActivityLogEntries_([
+    createActivityLogEntry_(
+      reviewer,
+      status === '退件' ? '退件檔案' : status === '通過' ? '通過檔案審核' : '更新檔案審核',
+      '已將「' + targetFile.File_Name + '」標記為「' + status + '」' + (status === '退件' && targetFile.Comment ? '，並附上退件意見。' : '。'),
+      'file',
+      targetFile.File_ID,
+      status === '退件' ? 'warning' : 'normal',
+      { source: 'reviewFile', teamId: targetFile.Team_ID, status: status }
+    )
+  ]);
+
+  return buildClientStateResultForUser_(state, reviewer, {
+    file: state.Files.find(function(file) {
+      return file.File_ID === targetFile.File_ID;
+    }) || hydrateFileRecord_(targetFile)
   });
 }
 
 function handleMarkNotificationsRead_(payload) {
   var state = loadState_();
-  var userId = String(payload.userId || '').trim();
+  var currentUser = requireSessionUser_(state, payload);
+  var userId = String(currentUser.User_ID || '');
   var notificationIds = ensureArray_(payload.notificationIds).map(function(notificationId) {
     return String(notificationId);
   });
   var markAll = payload.all === true || notificationIds.length === 0;
-
-  if (!userId) {
-    throw new Error('markNotificationsRead requires `userId`.');
-  }
 
   state.Notifications.forEach(function(notification) {
     if (notification.User_ID !== userId) return;
@@ -2949,8 +3862,9 @@ function handleMarkNotificationsRead_(payload) {
   });
 
   persistState_(state);
+  state = loadState_();
 
-  return buildClientStateResult_(state, {
+  return buildClientStateResultForUser_(state, currentUser, {
     notifications: state.Notifications.filter(function(notification) {
       return notification.User_ID === userId;
     })
@@ -2959,15 +3873,12 @@ function handleMarkNotificationsRead_(payload) {
 
 function handleClearNotifications_(payload) {
   var state = loadState_();
-  var userId = String(payload.userId || '').trim();
+  var currentUser = requireSessionUser_(state, payload);
+  var userId = String(currentUser.User_ID || '');
   var scope = String(payload.scope || 'selected').trim();
   var notificationIds = ensureArray_(payload.notificationIds).map(function(notificationId) {
     return String(notificationId);
   });
-
-  if (!userId) {
-    throw new Error('clearNotifications requires `userId`.');
-  }
 
   state.Notifications = state.Notifications.filter(function(notification) {
     if (notification.User_ID !== userId) {
@@ -2990,8 +3901,9 @@ function handleClearNotifications_(payload) {
   });
 
   persistState_(state);
+  state = loadState_();
 
-  return buildClientStateResult_(state, {
+  return buildClientStateResultForUser_(state, currentUser, {
     notifications: state.Notifications.filter(function(notification) {
       return notification.User_ID === userId;
     })
@@ -3362,8 +4274,8 @@ function validateRegistrationPayload_(teamOrMode, name, email, password) {
     throw new Error('請輸入有效的電子郵件。');
   }
 
-  if (String(password || '').length < 3) {
-    throw new Error('密碼至少需要 3 碼。');
+  if (String(password || '').length < MIN_PASSWORD_LENGTH) {
+    throw new Error('密碼至少需要 ' + MIN_PASSWORD_LENGTH + ' 碼。');
   }
 }
 
